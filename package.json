@@ -1,0 +1,57 @@
+{
+  "name": "juno_invoice_assistant_v1",
+  "version": "1.0.0",
+  "description": "AI-Powered Invoice Processing with BPA Integration - v1",
+  "repository": "<your-repo>",
+  "license": "UNLICENSED",
+  "private": true,
+  "dependencies": {
+    "@cap-js/hana": "^2",
+    "@sap-cloud-sdk/connectivity": "^4.1.2",
+    "@sap-cloud-sdk/http-client": "^4.1.2",
+    "@sap-cloud-sdk/util": "^4.1.2",
+    "@sap/cds": "^9",
+    "@sap/xsenv": "^5",
+    "@sap/xssec": "^4",
+    "express": "^4",
+    "passport": "^0.7.0"
+  },
+  "devDependencies": {
+    "@cap-js/sqlite": "^2",
+    "@sap/cds-dk": "^9",
+    "@sap/eslint-plugin-cds": "^3"
+  },
+  "scripts": {
+    "start": "cds-serve",
+    "watch": "cds watch --profile hybrid",
+    "build": "cds build --production",
+    "deploy": "cds deploy --to hana"
+  },
+  "cds": {
+    "requires": {
+      "db": {
+        "kind": "hana"
+      },
+      "auth": {
+        "[development]": {
+          "kind": "dummy"
+        },
+        "[production]": {
+          "kind": "xsuaa"
+        }
+      }
+    },
+    "hana": {
+      "deploy-format": "hdbtable"
+    },
+    "log": {
+      "levels": {
+        "invoice": "info",
+        "supplier": "info",
+        "po-matcher": "info",
+        "sap-posting": "info",
+        "service": "info"
+      }
+    }
+  }
+}
