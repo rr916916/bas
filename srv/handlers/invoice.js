@@ -137,7 +137,11 @@ module.exports = function(srv) {
   // RECORD APPROVAL (Legacy - kept for backward compatibility)
   // ============================================
   srv.on('RecordApproval', async (req) => {
-    const { headerId, approved, approver, comments } = req.data;
+    // BPA sends as flat key-value pairs
+    const headerId = req.data.headerId;
+    const approved = req.data.approved;
+    const approver = req.data.approver;
+    const comments = req.data.comments;
     
     if (!headerId || approved === undefined || !approver) {
       req.error(400, 'headerId, approved, and approver are required');
@@ -198,7 +202,8 @@ module.exports = function(srv) {
   // GET INVOICE STATUS (For BPA polling)
   // ============================================
   srv.on('GetInvoiceStatus', async (req) => {
-    const { headerId } = req.data;
+    // BPA sends as flat key-value pairs
+    const headerId = req.data.headerId;
     
     if (!headerId) {
       req.error(400, 'headerId is required');

@@ -13,7 +13,8 @@ module.exports = function(srv) {
   // MATCH SUPPLIER
   // ============================================
   srv.on('MatchSupplier', async (req) => {
-    const { headerId } = req.data;
+    // BPA sends as flat key-value pairs
+    const headerId = req.data.headerId;
     
     if (!headerId) {
       req.error(400, 'headerId is required');

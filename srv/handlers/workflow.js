@@ -11,7 +11,8 @@ module.exports = function(srv) {
   // STEP 1: INITIALIZE BPA WORKFLOW
   // ============================================
   srv.on('InitializeBPAWorkflow', async (req) => {
-    const { headerId } = req.data;
+    // BPA sends as flat key-value pairs in req.data
+    const headerId = req.data.headerId;
     
     if (!headerId) {
       req.error(400, 'headerId is required');
@@ -90,7 +91,11 @@ module.exports = function(srv) {
   // STEP 6: PROCESS SUPPLIER SELECTION
   // ============================================
   srv.on('ProcessSupplierSelection', async (req) => {
-    const { headerId, selectionType, supplierNumber, updatedName } = req.data;
+    // BPA sends as flat key-value pairs
+    const headerId = req.data.headerId;
+    const selectionType = req.data.selectionType;
+    const supplierNumber = req.data.supplierNumber;
+    const updatedName = req.data.updatedName;
 
     if (!headerId || !selectionType) {
       req.error(400, 'headerId and selectionType are required');
@@ -274,7 +279,8 @@ module.exports = function(srv) {
   // VALIDATE INVOICE (CONSOLIDATED)
   // ============================================
   srv.on('ValidateInvoice', async (req) => {
-    const { headerId } = req.data;
+    // BPA sends as flat key-value pairs
+    const headerId = req.data.headerId;
     
     if (!headerId) {
       req.error(400, 'headerId is required');

@@ -9,7 +9,9 @@ module.exports = function(srv) {
   // GET SUPPLIER CANDIDATES
   // ============================================
   srv.on('GetSupplierCandidates', async (req) => {
-    const { headerId, limit = 5 } = req.data;
+    // BPA sends as flat key-value pairs
+    const headerId = req.data.headerId;
+    const limit = req.data.limit || 5;
 
     if (!headerId) {
       req.error(400, 'headerId is required');
@@ -109,7 +111,8 @@ module.exports = function(srv) {
   // VALIDATE SUPPLIER NUMBER
   // ============================================
   srv.on('ValidateSupplierNumber', async (req) => {
-    const { supplierNumber } = req.data;
+    // BPA sends as flat key-value pairs
+    const supplierNumber = req.data.supplierNumber;
 
     if (!supplierNumber) {
       return {
@@ -135,7 +138,7 @@ module.exports = function(srv) {
         LOG.warn(`Supplier not found: ${paddedNumber}`);
         return {
           valid: false,
-          exists: false,
+          supplierExists: false,
           supplierNumber: paddedNumber,
           supplierName: null,
           isActive: false,
@@ -147,7 +150,7 @@ module.exports = function(srv) {
         LOG.warn(`Supplier is inactive: ${paddedNumber}`);
         return {
           valid: false,
-          exists: true,
+          supplierExists: true,
           supplierNumber: paddedNumber,
           supplierName: supplier.supplierName,
           isActive: false,
@@ -159,7 +162,7 @@ module.exports = function(srv) {
 
       return {
         valid: true,
-        exists: true,
+        supplierExists: true,
         supplierNumber: paddedNumber,
         supplierName: supplier.supplierName,
         isActive: true,
@@ -170,7 +173,7 @@ module.exports = function(srv) {
       LOG.error('Supplier validation failed:', error);
       return {
         valid: false,
-        exists: false,
+        supplierExists: false,
         supplierNumber: supplierNumber,
         supplierName: null,
         isActive: false,
