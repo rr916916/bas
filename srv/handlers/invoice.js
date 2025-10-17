@@ -1,4 +1,5 @@
 // srv/handlers/invoice.js
+// Basic invoice operations and legacy BPA actions
 const cds = require('@sap/cds');
 const { parseJSON, logProcess } = require('../utils/helpers');
 
@@ -7,7 +8,7 @@ module.exports = function(srv) {
   const { InvoiceHeader, DOXInvoiceItem } = srv.entities;
 
   // ============================================
-  // CREATE INVOICE FROM DOX
+  // CREATE INVOICE FROM DOX (Legacy - CPI calls this)
   // ============================================
   srv.on('CreateInvoiceFromDOX', async (req) => {
     const { data } = req.data;
@@ -81,7 +82,7 @@ module.exports = function(srv) {
         documentNumber: doxData.documentNumber || doxData.invoiceNumber,
         purchaseOrderNumber: doxData.purchaseOrderNumber || doxData.poNumber,
         
-        // Company code (from config or default)
+        // Company code
         companyCode: doxData.companyCode || process.env.DEFAULT_COMPANY_CODE || '1000'
       };
 
@@ -133,142 +134,7 @@ module.exports = function(srv) {
   });
 
   // ============================================
-  // VALIDATE FOR POSTING
-  // ============================================
-  srv.on('ValidateForPosting', async (req) => {
-    const { headerId } = req.data;
-    
-    if (!headerId) {
-      req.error(400, 'headerId is required');
-      return;
-    }
-
-    const tx = cds.tx(req);
-
-    const header = await tx.read(InvoiceHeader, headerId, h => {
-      h('*'),
-      h.doxItems('*'),
-      h.poItems('*')
-    });
-
-    if (!header) {
-      req.error(404, `Invoice ${headerId} not found`);
-      return;
-    }
-
-    const errors = [];
-
-    // Supplier validation
-    if (!header.matchedSupplierNumber) {
-      errors.push({
-        field: 'supplier',
-        message: 'Supplier not matched',
-        severity: 'ERROR'
-      });
-    } else if (header.supplierMatchScore < 0.7) {
-      errors.push({
-        field: 'supplier',
-        message: `Supplier match confidence low: ${(header.supplierMatchScore * 100).toFixed(1)}%`,
-        severity: 'WARNING'
-      });
-    }
-
-    // Amount validation
-    if (!header.netAmount || header.netAmount <= 0) {
-      errors.push({
-        field: 'netAmount',
-        message: 'Net amount is missing or invalid',
-        severity: 'ERROR'
-      });
-    }
-
-    // Company code
-    if (!header.companyCode) {
-      errors.push({
-        field: 'companyCode',
-        message: 'Company code is required',
-        severity: 'ERROR'
-      });
-    }
-
-    // Currency
-    if (!header.currencyCode) {
-      errors.push({
-        field: 'currency',
-        message: 'Currency code is required',
-        severity: 'ERROR'
-      });
-    }
-
-    // PO validation (if PO invoice)
-    if (header.purchaseOrderNumber) {
-      const doxItems = header.doxItems || [];
-      const matchedCount = doxItems.filter(i => i.matchStatus === 'MATCHED').length;
-
-      if (matchedCount === 0) {
-        errors.push({
-          field: 'poItems',
-          message: 'No DOX items matched to PO items',
-          severity: 'ERROR'
-        });
-      } else if (matchedCount < doxItems.length) {
-        errors.push({
-          field: 'poItems',
-          message: `Only ${matchedCount} of ${doxItems.length} items matched`,
-          severity: 'WARNING'
-        });
-      }
-
-      // 3-way match validation
-      if (header.threeWayMatchRequired && !header.grCheckPassed) {
-        errors.push({
-          field: 'goodsReceipt',
-          message: '3-way match failed: Goods receipt not posted for all items',
-          severity: 'ERROR'
-        });
-      }
-    }
-
-    // Document date
-    if (!header.documentDate) {
-      errors.push({
-        field: 'documentDate',
-        message: 'Document date is required',
-        severity: 'ERROR'
-      });
-    }
-
-    const hasErrors = errors.some(e => e.severity === 'ERROR');
-    const hasWarnings = errors.some(e => e.severity === 'WARNING');
-
-    let status = 'VALID';
-    let message = 'Validation passed successfully';
-
-    if (hasErrors) {
-      status = 'INVALID';
-      const errorCount = errors.filter(e => e.severity === 'ERROR').length;
-      message = `Validation failed with ${errorCount} error(s)`;
-    } else if (hasWarnings) {
-      status = 'VALID_WITH_WARNINGS';
-      const warningCount = errors.filter(e => e.severity === 'WARNING').length;
-      message = `Validation passed with ${warningCount} warning(s)`;
-    }
-
-    LOG.info(`Validation for invoice ${headerId}: ${status}`, { 
-      errorCount: errors.filter(e => e.severity === 'ERROR').length,
-      warningCount: errors.filter(e => e.severity === 'WARNING').length
-    });
-
-    return {
-      isValid: !hasErrors,
-      status,
-      message,
-      errors
-    };
-  });
-
-  // ============================================
-  // RECORD APPROVAL
+  // RECORD APPROVAL (Legacy - kept for backward compatibility)
   // ============================================
   srv.on('RecordApproval', async (req) => {
     const { headerId, approved, approver, comments } = req.data;
@@ -280,49 +146,56 @@ module.exports = function(srv) {
 
     const tx = cds.tx(req);
 
-    const header = await tx.read(InvoiceHeader, headerId, ['ID', 'status']);
-    
-    if (!header) {
-      req.error(404, `Invoice ${headerId} not found`);
-      return;
+    try {
+      const header = await tx.read(InvoiceHeader, headerId, ['ID', 'status']);
+      
+      if (!header) {
+        req.error(404, `Invoice ${headerId} not found`);
+        return;
+      }
+
+      const updateData = {
+        approvalStatus: approved ? 'APPROVED' : 'REJECTED',
+        approvedBy: approver,
+        approvedAt: new Date(),
+        step: approved ? 'APPROVED' : 'REJECTED',
+        status: approved ? 'COMPLETED' : 'ERROR',
+        result: approved ? 'SUCCESS' : 'FAILURE',
+        message: approved 
+          ? `Approved by ${approver}` 
+          : `Rejected by ${approver}: ${comments || 'No reason provided'}`
+      };
+
+      if (!approved) {
+        updateData.rejectionReason = comments || 'Rejected by approver';
+      }
+
+      await tx.update(InvoiceHeader, headerId).set(updateData);
+
+      await logProcess(tx, headerId, 
+        approved ? 'APPROVED' : 'REJECTED', 
+        approved ? 'COMPLETED' : 'REJECTED',
+        approved ? 'SUCCESS' : 'FAILURE',
+        comments || `${approved ? 'Approved' : 'Rejected'} by ${approver}`,
+        { approver, approved }
+      );
+
+      LOG.info(`Invoice ${headerId} ${approved ? 'approved' : 'rejected'} by ${approver}`);
+
+      return {
+        status: approved ? 'APPROVED' : 'REJECTED',
+        message: `Invoice ${approved ? 'approved' : 'rejected'} successfully`,
+        nextStep: approved ? 'POST_TO_SAP' : 'COMPLETE'
+      };
+
+    } catch (error) {
+      LOG.error('Record approval failed:', error);
+      req.error(500, `Failed to record approval: ${error.message}`);
     }
-
-    const updateData = {
-      approvalStatus: approved ? 'APPROVED' : 'REJECTED',
-      approvedBy: approver,
-      approvedAt: new Date(),
-      step: approved ? 'APPROVED' : 'REJECTED',
-      status: approved ? 'COMPLETED' : 'ERROR',
-      result: approved ? 'SUCCESS' : 'FAILURE',
-      message: approved 
-        ? `Approved by ${approver}` 
-        : `Rejected by ${approver}: ${comments || 'No reason provided'}`
-    };
-
-    if (!approved) {
-      updateData.rejectionReason = comments || 'Rejected by approver';
-    }
-
-    await tx.update(InvoiceHeader, headerId).set(updateData);
-
-    await logProcess(tx, headerId, 
-      approved ? 'APPROVED' : 'REJECTED', 
-      approved ? 'COMPLETED' : 'REJECTED',
-      approved ? 'SUCCESS' : 'FAILURE',
-      comments || `${approved ? 'Approved' : 'Rejected'} by ${approver}`,
-      { approver, approved }
-    );
-
-    LOG.info(`Invoice ${headerId} ${approved ? 'approved' : 'rejected'} by ${approver}`);
-
-    return {
-      status: approved ? 'APPROVED' : 'REJECTED',
-      message: `Invoice ${approved ? 'approved' : 'rejected'} successfully`
-    };
   });
 
   // ============================================
-  // GET INVOICE STATUS (for BPA polling)
+  // GET INVOICE STATUS (For BPA polling)
   // ============================================
   srv.on('GetInvoiceStatus', async (req) => {
     const { headerId } = req.data;
@@ -334,27 +207,103 @@ module.exports = function(srv) {
 
     const tx = cds.tx(req);
 
-    const header = await tx.read(InvoiceHeader, headerId, [
-      'ID', 'step', 'status', 'result', 'message',
-      'matchedSupplierNumber', 'poMatchStatus', 
-      'approvalStatus', 'accountingDocument'
-    ]);
+    try {
+      const header = await tx.read(InvoiceHeader, headerId, [
+        'ID', 'step', 'status', 'result', 'message',
+        'matchedSupplierNumber', 'poMatchStatus', 
+        'approvalStatus', 'accountingDocument',
+        'threeWayMatchStatus'
+      ]);
 
-    if (!header) {
-      req.error(404, `Invoice ${headerId} not found`);
+      if (!header) {
+        req.error(404, `Invoice ${headerId} not found`);
+        return;
+      }
+
+      return {
+        headerId: header.ID,
+        step: header.step,
+        status: header.status,
+        result: header.result,
+        message: header.message,
+        supplierMatched: !!header.matchedSupplierNumber,
+        poMatched: header.poMatchStatus === 'MATCHED',
+        validated: header.step === 'VALIDATED' || header.step === 'APPROVED',
+        approved: header.approvalStatus === 'APPROVED',
+        posted: !!header.accountingDocument,
+        accountingDocument: header.accountingDocument
+      };
+
+    } catch (error) {
+      LOG.error('Get invoice status failed:', error);
+      req.error(500, `Failed to get status: ${error.message}`);
+    }
+  });
+
+  // ============================================
+  // RECORD POSTING RESULT (Called by SAP posting handler)
+  // ============================================
+  srv.on('RecordPostingResult', async (req) => {
+    const { data } = req.data;
+    const payload = parseJSON(data);
+
+    if (!payload) {
+      req.error(400, 'Invalid JSON data');
       return;
     }
 
-    return {
-      headerId: header.ID,
-      step: header.step,
-      status: header.status,
-      result: header.result,
-      message: header.message,
-      supplierMatched: !!header.matchedSupplierNumber,
-      poMatched: header.poMatchStatus === 'MATCHED',
-      approved: header.approvalStatus === 'APPROVED',
-      posted: !!header.accountingDocument
-    };
+    const {
+      headerId,
+      accountingDocument,
+      fiscalYear,
+      accountingDocType,
+      sapReturnType,
+      sapReturnMessage,
+      sapMessageClass,
+      sapMessageNumber,
+      clearingDate
+    } = payload;
+
+    if (!headerId) {
+      req.error(400, 'headerId is required');
+      return;
+    }
+
+    const tx = cds.tx(req);
+
+    try {
+      const isSuccess = sapReturnType === 'S';
+
+      await tx.update(InvoiceHeader, headerId).set({
+        accountingDocument,
+        fiscalYear,
+        accountingDocType,
+        sapReturnType,
+        sapReturnMessage,
+        sapMessageClass,
+        sapMessageNumber,
+        clearingDate,
+        status: isSuccess ? 'COMPLETED' : 'ERROR',
+        step: isSuccess ? 'POSTED' : 'POST_FAILED',
+        result: isSuccess ? 'SUCCESS' : 'FAILURE'
+      });
+
+      await logProcess(tx, headerId, 'SAP_POST',
+        isSuccess ? 'POSTED' : 'FAILED',
+        isSuccess ? 'SUCCESS' : 'FAILURE',
+        sapReturnMessage
+      );
+
+      LOG.info(`Posting result recorded for invoice ${headerId}: ${isSuccess ? 'SUCCESS' : 'FAILURE'}`);
+
+      return {
+        status: isSuccess ? 'SUCCESS' : 'FAILURE',
+        message: sapReturnMessage
+      };
+
+    } catch (error) {
+      LOG.error('Record posting result failed:', error);
+      req.error(500, `Failed to record result: ${error.message}`);
+    }
   });
 };

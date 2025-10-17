@@ -10,7 +10,7 @@ module.exports = function(srv) {
   const { InvoiceHeader, SupplierVector } = srv.entities;
 
   // ============================================
-  // MATCH SUPPLIER - WITH GEOGRAPHIC BOOST
+  // MATCH SUPPLIER
   // ============================================
   srv.on('MatchSupplier', async (req) => {
     const { headerId } = req.data;
@@ -22,51 +22,52 @@ module.exports = function(srv) {
 
     const tx = cds.tx(req);
 
-    // Get invoice header with all address fields
-    const header = await tx.read(InvoiceHeader, headerId, [
-      'ID', 'senderName', 'receiverName', 'senderAddress', 
-      'senderCity', 'senderState', 'senderPostalCode'
-    ]);
-
-    if (!header) {
-      req.error(404, `Invoice ${headerId} not found`);
-      return;
-    }
-
-    // Determine supplier name to search
-    const supplierName = header.senderName || header.receiverName;
-
-    if (!supplierName) {
-      await tx.update(InvoiceHeader, headerId).set({
-        supplierMatchStatus: 'NO_MATCH',
-        step: 'SUPPLIER_MATCH_FAILED',
-        message: 'No supplier name found in invoice'
-      });
-
-      await logProcess(tx, headerId, 'MATCH_SUPPLIER', 'FAILED', 'FAILURE',
-        'No supplier name available for matching');
-
-      LOG.warn(`No supplier name found for invoice ${headerId}`);
-
-      return {
-        supplierNumber: null,
-        supplierName: null,
-        matchScore: 0,
-        confidence: 'NONE',
-        status: 'NO_MATCH',
-        message: 'No supplier name found on invoice'
-      };
-    }
-
-    LOG.info(`Matching supplier for invoice ${headerId}: "${supplierName}"`);
-    if (header.senderCity) LOG.info(`  City: ${header.senderCity}`);
-    if (header.senderState) LOG.info(`  State: ${header.senderState}`);
-    if (header.senderPostalCode) LOG.info(`  ZIP: ${header.senderPostalCode}`);
-
     try {
+      const header = await tx.read(InvoiceHeader, headerId, [
+        'ID', 'senderName', 'receiverName', 'senderAddress', 
+        'senderCity', 'senderState', 'senderPostalCode'
+      ]);
+
+      if (!header) {
+        req.error(404, `Invoice ${headerId} not found`);
+        return;
+      }
+
+      const supplierName = header.senderName || header.receiverName;
+
+      if (!supplierName) {
+        await tx.update(InvoiceHeader, headerId).set({
+          supplierMatchStatus: 'NO_MATCH',
+          step: 'SUPPLIER_MATCH_FAILED',
+          message: 'No supplier name found in invoice'
+        });
+
+        await logProcess(tx, headerId, 'MATCH_SUPPLIER', 'FAILED', 'FAILURE',
+          'No supplier name available for matching');
+
+        LOG.warn(`No supplier name found for invoice ${headerId}`);
+
+        return {
+          supplierNumber: null,
+          supplierName: null,
+          matchScore: 0,
+          confidence: 'NONE',
+          status: 'NO_MATCH',
+          geographicMatch: false,
+          boostFactors: 'NONE',
+          alternativeCandidates: [],
+          message: 'No supplier name found on invoice',
+          requiresManualReview: true
+        };
+      }
+
+      LOG.info(`Matching supplier for invoice ${headerId}: "${supplierName}"`);
+      if (header.senderCity) LOG.info(`  City: ${header.senderCity}`);
+      if (header.senderState) LOG.info(`  State: ${header.senderState}`);
+      if (header.senderPostalCode) LOG.info(`  ZIP: ${header.senderPostalCode}`);
+
       const physicalTable = 'JUNO_INVOICE_ASSISTANT_V1_SUPPLIERVECTOR';
       
-      // Step 1: Vector search on name (get top 10 candidates)
       const rows = await tx.run(`
         SELECT
           "SUPPLIERNUMBER" as "supplierNumber",
@@ -106,16 +107,18 @@ module.exports = function(srv) {
           matchScore: 0,
           confidence: 'NONE',
           status: 'NO_MATCH',
-          message: `No supplier found matching "${supplierName}"`
+          geographicMatch: false,
+          boostFactors: 'NONE',
+          alternativeCandidates: [],
+          message: `No supplier found matching "${supplierName}"`,
+          requiresManualReview: true
         };
       }
 
-      // Step 2: Apply geographic boost to top candidates
       const scoredResults = rows.map(row => {
         let finalScore = row.nameScore;
         let boostFactors = [];
 
-        // Boost if city matches (case-insensitive)
         if (header.senderCity && row.city) {
           const invoiceCity = header.senderCity.trim().toUpperCase();
           const supplierCity = row.city.trim().toUpperCase();
@@ -127,7 +130,6 @@ module.exports = function(srv) {
           }
         }
 
-        // Boost if state matches
         if (header.senderState && row.state) {
           const invoiceState = header.senderState.trim().toUpperCase();
           const supplierState = row.state.trim().toUpperCase();
@@ -139,7 +141,6 @@ module.exports = function(srv) {
           }
         }
 
-        // Boost if postal code matches (first 5 digits)
         if (header.senderPostalCode && row.postalCode) {
           const invoiceZip = header.senderPostalCode.replace(/[^0-9]/g, '').substring(0, 5);
           const supplierZip = row.postalCode.replace(/[^0-9]/g, '').substring(0, 5);
@@ -151,24 +152,26 @@ module.exports = function(srv) {
           }
         }
 
-        // Cap at 1.0
         finalScore = Math.min(finalScore, 1.0);
 
         return {
-          ...row,
+          supplierNumber: row.supplierNumber,
+          supplierName: row.supplierName,
+          altNames: row.altNames,
+          city: row.city,
+          state: row.state,
+          postalCode: row.postalCode,
+          matchScore: finalScore,
           originalScore: row.nameScore,
-          finalScore,
           boostFactors: boostFactors.length > 0 ? boostFactors.join('+') : 'NONE'
         };
       });
 
-      // Step 3: Sort by final score
-      scoredResults.sort((a, b) => b.finalScore - a.finalScore);
+      scoredResults.sort((a, b) => b.matchScore - a.matchScore);
 
       const bestMatch = scoredResults[0];
-      const matchScore = bestMatch.finalScore;
+      const matchScore = bestMatch.matchScore;
 
-      // Step 4: Determine confidence based on final score
       let confidence = 'LOW';
       let matchStatus = 'MANUAL_REVIEW';
 
@@ -182,7 +185,7 @@ module.exports = function(srv) {
         confidence = 'LOW';
         matchStatus = 'MANUAL_REVIEW';
       } else {
-        confidence = 'VERY_LOW';
+        confidence = 'NONE';
         matchStatus = 'NO_MATCH';
       }
 
@@ -192,7 +195,6 @@ module.exports = function(srv) {
       LOG.info(`  - Final score: ${matchScore.toFixed(4)}`);
       LOG.info(`  - Confidence: ${confidence}`);
 
-      // Step 5: Update invoice header
       await tx.update(InvoiceHeader, headerId).set({
         matchedSupplierNumber: bestMatch.supplierNumber,
         matchedSupplierName: bestMatch.supplierName,
@@ -204,12 +206,12 @@ module.exports = function(srv) {
         message: `Supplier matched: ${bestMatch.supplierName} (${confidence} confidence, score: ${(matchScore * 100).toFixed(1)}%)`
       });
 
-      // Update supplier last used timestamp
       await tx.update(SupplierVector, bestMatch.supplierNumber).set({
         lastChangedAt: new Date()
       });
 
-      // Log detailed results
+      const alternativeCandidates = scoredResults.slice(1, 6);
+
       await logProcess(tx, headerId, 'MATCH_SUPPLIER', matchStatus,
         matchStatus === 'MATCHED' ? 'SUCCESS' : 'PARTIAL',
         `Matched to ${bestMatch.supplierName} (name: ${bestMatch.originalScore.toFixed(4)}, boosts: ${bestMatch.boostFactors}, final: ${matchScore.toFixed(4)})`,
@@ -220,7 +222,7 @@ module.exports = function(srv) {
             city: r.city,
             state: r.state,
             nameScore: r.originalScore,
-            finalScore: r.finalScore,
+            finalScore: r.matchScore,
             boosts: r.boostFactors
           }))
         }
@@ -232,7 +234,11 @@ module.exports = function(srv) {
         matchScore,
         confidence,
         status: matchStatus,
-        message: `Supplier matched with ${confidence} confidence (${(matchScore * 100).toFixed(1)}%)`
+        geographicMatch: bestMatch.boostFactors !== 'NONE',
+        boostFactors: bestMatch.boostFactors,
+        alternativeCandidates,
+        message: `Supplier matched with ${confidence} confidence (${(matchScore * 100).toFixed(1)}%)`,
+        requiresManualReview: confidence === 'LOW' || confidence === 'NONE'
       };
 
     } catch (error) {
@@ -253,7 +259,7 @@ module.exports = function(srv) {
   });
 
   // ============================================
-  // SYNC SUPPLIERS FROM SAP
+  // SYNC SUPPLIERS
   // ============================================
   srv.on('SyncSuppliers', async (req) => {
     const { mode = 'delta', since } = req.data;
@@ -270,7 +276,6 @@ module.exports = function(srv) {
 
       LOG.info(`Fetched ${suppliers.length} suppliers from SAP`);
 
-      // Upsert suppliers
       let totalSynced = 0;
       const CHUNK_SIZE = 200;
 
@@ -282,7 +287,6 @@ module.exports = function(srv) {
         LOG.info(`Synced ${totalSynced}/${suppliers.length} suppliers`);
       }
 
-      // Refresh embeddings
       let embeddingsRefreshed = false;
       try {
         const result = await srv.send({ event: 'RefreshSupplierEmbeddings' });
@@ -316,8 +320,6 @@ module.exports = function(srv) {
     const physicalTable = 'JUNO_INVOICE_ASSISTANT_V1_SUPPLIERVECTOR';
 
     try {
-      // Generate embeddings from name + alternative names only
-      // Using DOCUMENT type for symmetric name-to-name matching
       await db.run(`
         UPDATE "${physicalTable}"
         SET "EMBEDDING" = VECTOR_EMBEDDING(
@@ -337,7 +339,6 @@ module.exports = function(srv) {
     } catch (error) {
       LOG.warn(`Embeddings service unavailable: ${error.message}`);
       
-      // Fallback: just update timestamp
       try {
         await db.run(`
           UPDATE "${physicalTable}"
@@ -354,7 +355,7 @@ module.exports = function(srv) {
   });
 
   // ============================================
-  // FETCH SUPPLIERS FROM SAP - WITH ADDRESSES
+  // HELPERS
   // ============================================
   async function fetchSuppliersFromSAP(destName, client, mode, since) {
     const PATH = '/API_BUSINESS_PARTNER/A_BusinessPartner';
@@ -379,7 +380,6 @@ module.exports = function(srv) {
       filter += ` and LastChangeDate ge datetime'${sinceDate}T00:00:00'`;
     }
 
-    // Expand to get address information
     const expand = 'to_BusinessPartnerAddress';
 
     const url = buildUrl(PATH, {
@@ -410,17 +410,14 @@ module.exports = function(srv) {
                        parseODataV2Date(row.CreationDate) ||
                        new Date();
 
-    // Get primary address from expanded navigation
     const addresses = row.to_BusinessPartnerAddress?.results || 
                      row.to_BusinessPartnerAddress || 
                      [];
     
-    // Find primary address (AddressID = '1') or use first available
     const primaryAddress = Array.isArray(addresses) 
       ? (addresses.find(a => a.AddressID === '1') || addresses[0] || {})
       : addresses;
 
-    // Build alternative names from all available sources
     const altNames = [
       row.SearchTerm1,
       row.SearchTerm2,
@@ -433,7 +430,6 @@ module.exports = function(srv) {
       supplierName: row.BusinessPartnerFullName || row.BusinessPartnerName || '',
       altNames: altNames || '',
       
-      // Address fields
       street: primaryAddress.StreetName || '',
       city: primaryAddress.CityName || '',
       postalCode: primaryAddress.PostalCode || '',
