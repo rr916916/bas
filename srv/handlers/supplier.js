@@ -356,10 +356,17 @@ module.exports = function(srv) {
   });
 
   // ============================================
-  // HELPERS
+  // HELPERS - FIXED: Uses ONLY API_BUSINESS_PARTNER
   // ============================================
+  
+  /**
+   * ✅ FIXED: Fetch suppliers using API_BUSINESS_PARTNER
+   * Works for both on-prem and cloud (same service, same metadata)
+   */
   async function fetchSuppliersFromSAP(destName, client, mode, since) {
-    const PATH = '/API_BUSINESS_PARTNER/A_BusinessPartner';
+    const PATH = '/sap/opu/odata/sap/API_BUSINESS_PARTNER/A_BusinessPartner';
+    
+    // ✅ Fields from YOUR metadata
     const SELECT = [
       'BusinessPartner',
       'BusinessPartnerFullName',
@@ -402,7 +409,7 @@ module.exports = function(srv) {
     const results = data?.d?.results || data?.value || [];
 
     return results
-      .filter(r => r.Supplier && r.BusinessPartnerIsBlocked !== 'X')
+      .filter(r => r.Supplier && r.BusinessPartnerIsBlocked !== true)
       .map(mapSupplierRow);
   }
 

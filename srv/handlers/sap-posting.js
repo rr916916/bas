@@ -1,18 +1,21 @@
-// srv/handlers/sap-posting.js
+// srv/handlers/supplier.js
 const cds = require('@sap/cds');
 const { executeHttpRequest } = require('@sap-cloud-sdk/http-client');
-const { parseJSON, logProcess } = require('../utils/helpers');
+const { parseODataV2Date, logProcess } = require('../utils/helpers');
+
+const MODEL = process.env.EMBEDDINGS_MODEL || 'SAP_GXY.20250407';
 
 module.exports = function(srv) {
-  const LOG = cds.log('sap-posting');
-  const { InvoiceHeader, DOXInvoiceItem, SAPPOItem } = srv.entities;
+  const LOG = cds.log('supplier');
+  const { InvoiceHeader, SupplierVector } = srv.entities;
 
   // ============================================
-  // POST TO SAP
+  // MATCH SUPPLIER
   // ============================================
-  srv.on('PostToSAP', async (req) => {
-    const { headerId, postingType = 'SUPPLIER_INVOICE' } = req.data;
-
+  srv.on('MatchSupplier', async (req) => {
+    // BPA sends as flat key-value pairs
+    const headerId = req.data.headerId;
+    
     if (!headerId) {
       req.error(400, 'headerId is required');
       return;
@@ -20,518 +23,466 @@ module.exports = function(srv) {
 
     const tx = cds.tx(req);
 
-    // Get invoice with all related data
-    const header = await tx.read(InvoiceHeader, headerId, h => {
-      h('*'),
-      h.doxItems(di => di('*')),
-      h.poItems(pi => pi('*'))
-    });
-
-    if (!header) {
-      req.error(404, `Invoice ${headerId} not found`);
-      return;
-    }
-
-    LOG.info(`Posting invoice ${headerId} to SAP as ${postingType}`);
-
-    const DEST_NAME = process.env.S4_DEST_NAME || 'S4HANA';
-    const SYSTEM_KIND = process.env.S4_KIND || 'cloud';
-
     try {
-      let sapResponse;
+      const header = await tx.read(InvoiceHeader, headerId, [
+        'ID', 'senderName', 'receiverName', 'senderAddress', 
+        'senderCity', 'senderState', 'senderPostalCode'
+      ]);
 
-      if (postingType === 'SUPPLIER_INVOICE') {
-        sapResponse = await postSupplierInvoice(header, DEST_NAME, SYSTEM_KIND);
-      } else if (postingType === 'ACCOUNTING_DOC') {
-        sapResponse = await postAccountingDocument(header, DEST_NAME, SYSTEM_KIND);
-      } else {
-        req.error(400, `Invalid posting type: ${postingType}`);
+      if (!header) {
+        req.error(404, `Invoice ${headerId} not found`);
         return;
       }
 
-      const success = sapResponse.type === 'S';
+      const supplierName = header.senderName || header.receiverName;
 
-      // Update header
-      await tx.update(InvoiceHeader, headerId).set({
-        accountingDocument: sapResponse.document,
-        fiscalYear: sapResponse.fiscalYear,
-        accountingDocType: sapResponse.docType,
-        sapReturnType: sapResponse.type,
-        sapReturnMessage: sapResponse.message,
-        sapMessageClass: sapResponse.messageClass,
-        sapMessageNumber: sapResponse.messageNumber,
-        step: success ? 'POSTED' : 'POST_FAILED',
-        status: success ? 'COMPLETED' : 'ERROR',
-        result: success ? 'SUCCESS' : 'FAILURE',
-        postingDate: success ? new Date().toISOString().split('T')[0] : null
+      if (!supplierName) {
+        await tx.update(InvoiceHeader, headerId).set({
+          supplierMatchStatus: 'NO_MATCH',
+          step: 'SUPPLIER_MATCH_FAILED',
+          message: 'No supplier name found in invoice'
+        });
+
+        await logProcess(tx, headerId, 'MATCH_SUPPLIER', 'FAILED', 'FAILURE',
+          'No supplier name available for matching');
+
+        LOG.warn(`No supplier name found for invoice ${headerId}`);
+
+        return {
+          supplierNumber: null,
+          supplierName: null,
+          matchScore: 0,
+          confidence: 'NONE',
+          status: 'NO_MATCH',
+          geographicMatch: false,
+          boostFactors: 'NONE',
+          alternativeCandidates: [],
+          message: 'No supplier name found on invoice',
+          requiresManualReview: true
+        };
+      }
+
+      LOG.info(`Matching supplier for invoice ${headerId}: "${supplierName}"`);
+      if (header.senderCity) LOG.info(`  City: ${header.senderCity}`);
+      if (header.senderState) LOG.info(`  State: ${header.senderState}`);
+      if (header.senderPostalCode) LOG.info(`  ZIP: ${header.senderPostalCode}`);
+
+      const physicalTable = 'JUNO_INVOICE_ASSISTANT_V1_SUPPLIERVECTOR';
+      
+      const rows = await tx.run(`
+        SELECT
+          "SUPPLIERNUMBER" as "supplierNumber",
+          "SUPPLIERNAME" as "supplierName",
+          "ALTNAMES" as "altNames",
+          "STREET" as "street",
+          "CITY" as "city",
+          "STATE" as "state",
+          "POSTALCODE" as "postalCode",
+          "COUNTRY" as "country",
+          COSINE_SIMILARITY(
+            VECTOR_EMBEDDING(?, 'DOCUMENT', ?),
+            "EMBEDDING"
+          ) AS "nameScore"
+        FROM "${physicalTable}"
+        WHERE "EMBEDDING" IS NOT NULL
+          AND "ISACTIVE" = TRUE
+        ORDER BY "nameScore" DESC
+        LIMIT 10
+      `, [supplierName.trim(), MODEL]);
+
+      if (!rows || rows.length === 0) {
+        LOG.warn(`No supplier matches found for: "${supplierName}"`);
+
+        await tx.update(InvoiceHeader, headerId).set({
+          supplierMatchStatus: 'NO_MATCH',
+          step: 'SUPPLIER_MATCH_FAILED',
+          message: `No supplier match found for: ${supplierName}`
+        });
+
+        await logProcess(tx, headerId, 'MATCH_SUPPLIER', 'NO_MATCH', 'FAILURE',
+          `No supplier found for: ${supplierName}`);
+
+        return {
+          supplierNumber: null,
+          supplierName: null,
+          matchScore: 0,
+          confidence: 'NONE',
+          status: 'NO_MATCH',
+          geographicMatch: false,
+          boostFactors: 'NONE',
+          alternativeCandidates: [],
+          message: `No supplier found matching "${supplierName}"`,
+          requiresManualReview: true
+        };
+      }
+
+      const scoredResults = rows.map(row => {
+        let finalScore = row.nameScore;
+        let boostFactors = [];
+
+        if (header.senderCity && row.city) {
+          const invoiceCity = header.senderCity.trim().toUpperCase();
+          const supplierCity = row.city.trim().toUpperCase();
+          
+          if (invoiceCity === supplierCity) {
+            finalScore += 0.05;
+            boostFactors.push('CITY');
+            LOG.info(`  ✓ City match: ${row.city}`);
+          }
+        }
+
+        if (header.senderState && row.state) {
+          const invoiceState = header.senderState.trim().toUpperCase();
+          const supplierState = row.state.trim().toUpperCase();
+          
+          if (invoiceState === supplierState) {
+            finalScore += 0.03;
+            boostFactors.push('STATE');
+            LOG.info(`  ✓ State match: ${row.state}`);
+          }
+        }
+
+        if (header.senderPostalCode && row.postalCode) {
+          const invoiceZip = header.senderPostalCode.replace(/[^0-9]/g, '').substring(0, 5);
+          const supplierZip = row.postalCode.replace(/[^0-9]/g, '').substring(0, 5);
+          
+          if (invoiceZip && supplierZip && invoiceZip === supplierZip) {
+            finalScore += 0.02;
+            boostFactors.push('ZIP');
+            LOG.info(`  ✓ ZIP match: ${supplierZip}`);
+          }
+        }
+
+        finalScore = Math.min(finalScore, 1.0);
+
+        return {
+          supplierNumber: row.supplierNumber,
+          supplierName: row.supplierName,
+          altNames: row.altNames,
+          city: row.city,
+          state: row.state,
+          postalCode: row.postalCode,
+          matchScore: finalScore,
+          originalScore: row.nameScore,
+          boostFactors: boostFactors.length > 0 ? boostFactors.join('+') : 'NONE'
+        };
       });
 
-      await logProcess(tx, headerId, 'SAP_POST', 
-        success ? 'POSTED' : 'FAILED',
-        success ? 'SUCCESS' : 'FAILURE',
-        sapResponse.message,
-        { sapResponse: sapResponse.fullResponse }
+      scoredResults.sort((a, b) => b.matchScore - a.matchScore);
+
+      const bestMatch = scoredResults[0];
+      const matchScore = bestMatch.matchScore;
+
+      let confidence = 'LOW';
+      let matchStatus = 'MANUAL_REVIEW';
+
+      if (matchScore >= 0.95) {
+        confidence = 'HIGH';
+        matchStatus = 'MATCHED';
+      } else if (matchScore >= 0.85) {
+        confidence = 'MEDIUM';
+        matchStatus = 'MATCHED';
+      } else if (matchScore >= 0.70) {
+        confidence = 'LOW';
+        matchStatus = 'MANUAL_REVIEW';
+      } else {
+        confidence = 'NONE';
+        matchStatus = 'NO_MATCH';
+      }
+
+      LOG.info(`✓ Best match: ${bestMatch.supplierName} (${bestMatch.supplierNumber})`);
+      LOG.info(`  - Name score: ${bestMatch.originalScore.toFixed(4)}`);
+      LOG.info(`  - Geographic boosts: ${bestMatch.boostFactors}`);
+      LOG.info(`  - Final score: ${matchScore.toFixed(4)}`);
+      LOG.info(`  - Confidence: ${confidence}`);
+
+      await tx.update(InvoiceHeader, headerId).set({
+        matchedSupplierNumber: bestMatch.supplierNumber,
+        matchedSupplierName: bestMatch.supplierName,
+        supplierMatchScore: matchScore,
+        supplierMatchStatus: matchStatus,
+        supplier: bestMatch.supplierNumber,
+        supplierName: bestMatch.supplierName,
+        step: 'SUPPLIER_MATCHED',
+        message: `Supplier matched: ${bestMatch.supplierName} (${confidence} confidence, score: ${(matchScore * 100).toFixed(1)}%)`
+      });
+
+      await tx.update(SupplierVector, bestMatch.supplierNumber).set({
+        lastChangedAt: new Date()
+      });
+
+      const alternativeCandidates = scoredResults.slice(1, 6);
+
+      await logProcess(tx, headerId, 'MATCH_SUPPLIER', matchStatus,
+        matchStatus === 'MATCHED' ? 'SUCCESS' : 'PARTIAL',
+        `Matched to ${bestMatch.supplierName} (name: ${bestMatch.originalScore.toFixed(4)}, boosts: ${bestMatch.boostFactors}, final: ${matchScore.toFixed(4)})`,
+        {
+          topMatches: scoredResults.slice(0, 3).map(r => ({
+            supplier: r.supplierNumber,
+            name: r.supplierName,
+            city: r.city,
+            state: r.state,
+            nameScore: r.originalScore,
+            finalScore: r.matchScore,
+            boosts: r.boostFactors
+          }))
+        }
       );
 
-      LOG.info(`Invoice ${headerId} posting ${success ? 'succeeded' : 'failed'}: ${sapResponse.message}`);
-
       return {
-        success,
-        accountingDocument: sapResponse.document,
-        fiscalYear: sapResponse.fiscalYear,
-        message: sapResponse.message,
-        sapResponse: JSON.stringify(sapResponse.fullResponse)
+        supplierNumber: bestMatch.supplierNumber,
+        supplierName: bestMatch.supplierName,
+        matchScore,
+        confidence,
+        status: matchStatus,
+        geographicMatch: bestMatch.boostFactors !== 'NONE',
+        boostFactors: bestMatch.boostFactors,
+        alternativeCandidates,
+        message: `Supplier matched with ${confidence} confidence (${(matchScore * 100).toFixed(1)}%)`,
+        requiresManualReview: confidence === 'LOW' || confidence === 'NONE'
       };
 
     } catch (error) {
-      LOG.error('SAP posting failed:', error);
+      LOG.error('Supplier matching failed:', error);
 
       await tx.update(InvoiceHeader, headerId).set({
-        step: 'POST_ERROR',
-        status: 'ERROR',
-        result: 'FAILURE',
+        supplierMatchStatus: 'ERROR',
+        step: 'SUPPLIER_MATCH_ERROR',
         lastError: error.message,
-        lastErrorAt: new Date(),
-        retryCount: { '+=': 1 }
+        lastErrorAt: new Date()
       });
 
-      await logProcess(tx, headerId, 'SAP_POST', 'ERROR', 'FAILURE',
-        `Posting error: ${error.message}`);
+      await logProcess(tx, headerId, 'MATCH_SUPPLIER', 'ERROR', 'FAILURE',
+        `Supplier matching error: ${error.message}`);
 
-      req.error(500, `SAP posting failed: ${error.message}`);
+      req.error(500, `Supplier matching failed: ${error.message}`);
     }
   });
 
   // ============================================
-  // RECORD POSTING RESULT
+  // SYNC SUPPLIERS
   // ============================================
-  srv.on('RecordPostingResult', async (req) => {
-    const { data } = req.data;
-    const payload = parseJSON(data);
-
-    if (!payload) {
-      req.error(400, 'Invalid JSON data');
-      return;
-    }
-
-    const {
-      headerId,
-      accountingDocument,
-      fiscalYear,
-      accountingDocType,
-      sapReturnType,
-      sapReturnMessage,
-      sapMessageClass,
-      sapMessageNumber,
-      clearingDate
-    } = payload;
-
-    if (!headerId) {
-      req.error(400, 'headerId is required');
-      return;
-    }
-
+  srv.on('SyncSuppliers', async (req) => {
+    const { mode = 'delta', since } = req.data;
     const tx = cds.tx(req);
+    const startTime = Date.now();
 
-    const isSuccess = sapReturnType === 'S';
+    LOG.info(`Starting supplier sync: mode=${mode}`);
 
-    await tx.update(InvoiceHeader, headerId).set({
-      accountingDocument,
-      fiscalYear,
-      accountingDocType,
-      sapReturnType,
-      sapReturnMessage,
-      sapMessageClass,
-      sapMessageNumber,
-      clearingDate,
-      status: isSuccess ? 'COMPLETED' : 'ERROR',
-      step: isSuccess ? 'POSTED' : 'POST_FAILED',
-      result: isSuccess ? 'SUCCESS' : 'FAILURE'
-    });
+    const DEST_NAME = process.env.S4_DEST_NAME || 'S4HANA';
+    const SAP_CLIENT = process.env.S4_CLIENT || '100';
+    const SYSTEM_KIND = process.env.S4_KIND || 'onprem'; // ✅ Default to on-prem
 
-    await logProcess(tx, headerId, 'SAP_POST',
-      isSuccess ? 'POSTED' : 'FAILED',
-      isSuccess ? 'SUCCESS' : 'FAILURE',
-      sapReturnMessage
+    try {
+      const suppliers = await fetchSuppliersFromSAP(DEST_NAME, SAP_CLIENT, mode, since, SYSTEM_KIND);
+
+      LOG.info(`Fetched ${suppliers.length} suppliers from SAP`);
+
+      let totalSynced = 0;
+      const CHUNK_SIZE = 200;
+
+      for (let i = 0; i < suppliers.length; i += CHUNK_SIZE) {
+        const chunk = suppliers.slice(i, i + CHUNK_SIZE);
+        await tx.run(UPSERT.into(SupplierVector).entries(chunk));
+        totalSynced += chunk.length;
+        
+        LOG.info(`Synced ${totalSynced}/${suppliers.length} suppliers`);
+      }
+
+      let embeddingsRefreshed = false;
+      try {
+        const result = await srv.send({ event: 'RefreshSupplierEmbeddings' });
+        embeddingsRefreshed = result && result.value === 1;
+        LOG.info(`Supplier embeddings refreshed: ${embeddingsRefreshed}`);
+      } catch (e) {
+        LOG.warn(`Embeddings not refreshed: ${e.message}`);
+      }
+
+      const duration = Date.now() - startTime;
+
+      LOG.info(`Supplier sync completed: ${totalSynced} synced in ${duration}ms`);
+
+      return {
+        totalSynced,
+        embeddingsRefreshed,
+        duration
+      };
+
+    } catch (error) {
+      LOG.error('Supplier sync failed:', error);
+      req.error(500, `Supplier sync failed: ${error.message}`);
+    }
+  });
+
+  // ============================================
+  // REFRESH EMBEDDINGS
+  // ============================================
+  srv.on('RefreshSupplierEmbeddings', async (req) => {
+    const db = cds.db;
+    const physicalTable = 'JUNO_INVOICE_ASSISTANT_V1_SUPPLIERVECTOR';
+
+    try {
+      await db.run(`
+        UPDATE "${physicalTable}"
+        SET "EMBEDDING" = VECTOR_EMBEDDING(
+          COALESCE("SUPPLIERNAME",'') || ' ' || COALESCE("ALTNAMES",''),
+          'DOCUMENT',
+          ?
+        ),
+        "LASTREFRESHED" = CURRENT_UTCTIMESTAMP
+        WHERE "EMBEDDING" IS NULL
+           OR "LASTREFRESHED" IS NULL
+           OR DAYS_BETWEEN("LASTREFRESHED", CURRENT_UTCTIMESTAMP) > 7
+      `, [MODEL]);
+
+      LOG.info('Supplier embeddings refreshed successfully');
+      return { value: 1, message: 'Embeddings refreshed successfully' };
+
+    } catch (error) {
+      LOG.warn(`Embeddings service unavailable: ${error.message}`);
+      
+      try {
+        await db.run(`
+          UPDATE "${physicalTable}"
+          SET "LASTREFRESHED" = CURRENT_UTCTIMESTAMP
+          WHERE "LASTREFRESHED" IS NULL
+             OR DAYS_BETWEEN("LASTREFRESHED", CURRENT_UTCTIMESTAMP) > 7
+        `);
+      } catch (e) {
+        // Ignore
+      }
+
+      return { value: 0, message: `Embeddings unavailable: ${error.message}` };
+    }
+  });
+
+  // ============================================
+  // HELPERS
+  // ============================================
+
+  /**
+   * ✅ Fetch suppliers from SAP
+   * ON-PREM: API_BUSINESS_PARTNER from https://rr916.free.beeceptor.com/API_BUSINESS_PARTNER/$metadata
+   * CLOUD: API_BUSINESS_PARTNER from SAP API Business Hub
+   * Both use same structure!
+   */
+  async function fetchSuppliersFromSAP(destName, client, mode, since, systemKind) {
+    let path, select, filter, expand, url;
+
+    // SELECT fields - same for both cloud and on-prem
+    select = [
+      'BusinessPartner',
+      'BusinessPartnerFullName',
+      'BusinessPartnerName',
+      'SearchTerm1',
+      'SearchTerm2',
+      'Supplier',
+      'LastChangeDate',
+      'CreationDate',
+      'BusinessPartnerIsBlocked',
+      'OrganizationBPName1',
+      'OrganizationBPName2'
+    ].join(',');
+
+    // Build filter - same logic for both
+    filter = `Supplier ne ''`;
+    if (mode === 'delta' && since) {
+      const sinceDate = since.toISOString().split('T')[0];
+      filter += ` and LastChangeDate ge datetime'${sinceDate}T00:00:00'`;
+    }
+
+    // Expand to get addresses
+    expand = 'to_BusinessPartnerAddress';
+
+    if (systemKind === 'cloud') {
+      path = '/API_BUSINESS_PARTNER/A_BusinessPartner';
+
+      url = buildUrl(path, {
+        $select: select,
+        $filter: filter,
+        $expand: expand,
+        $top: 5000,
+        'sap-client': client,
+        $format: 'json'
+      });
+
+      LOG.info(`Fetching suppliers from CLOUD: ${path}`);
+
+    } else {
+      // ON-PREM (DEFAULT): Your metadata - same API structure
+      path = '/API_BUSINESS_PARTNER/A_BusinessPartner';
+
+      url = buildUrl(path, {
+        $select: select,
+        $filter: filter,
+        $expand: expand,
+        $top: 5000,
+        'sap-client': client,
+        $format: 'json'
+      });
+
+      LOG.info(`Fetching suppliers from ON-PREM: ${path}`);
+    }
+
+    const { data } = await executeHttpRequest(
+      { destinationName: destName },
+      { method: 'GET', url, headers: { Accept: 'application/json' } }
     );
 
-    LOG.info(`Posting result recorded for invoice ${headerId}: ${isSuccess ? 'SUCCESS' : 'FAILURE'}`);
+    const results = data?.d?.results || data?.value || [];
 
-    return {
-      status: isSuccess ? 'SUCCESS' : 'FAILURE',
-      message: sapReturnMessage
-    };
-  });
-
-  // ============================================
-  // HELPER: POST SUPPLIER INVOICE
-  // ============================================
-  async function postSupplierInvoice(header, destName, systemKind) {
-    LOG.info(`Posting supplier invoice to SAP (${systemKind})`);
-
-    const payload = buildSupplierInvoicePayload(header);
-
-    // Log payload for debugging
-    LOG.info('Posting payload:', JSON.stringify(payload, null, 2));
-
-    if (systemKind === 'cloud') {
-      const path = '/API_SUPPLIERINVOICE_PROCESS_SRV/A_SupplierInvoice';
-
-      try {
-        const { data } = await executeHttpRequest(
-          { destinationName: destName },
-          {
-            method: 'POST',
-            url: path,
-            headers: {
-              'Content-Type': 'application/json',
-              'Accept': 'application/json'
-            },
-            data: payload
-          }
-        );
-
-        // Handle different response formats (OData v2 wraps in 'd')
-        const result = data?.d || data;
-
-        LOG.info('SAP Response:', JSON.stringify(result, null, 2));
-
-        return {
-          type: 'S',
-          document: result.SupplierInvoice,
-          fiscalYear: result.FiscalYear,
-          docType: 'RE',
-          message: `Supplier invoice ${result.SupplierInvoice} created successfully`,
-          messageClass: '',
-          messageNumber: '',
-          fullResponse: data
-        };
-
-      } catch (error) {
-        LOG.error('SAP API Error:', {
-          message: error.message,
-          response: error.response?.data,
-          status: error.response?.status
-        });
-
-        // Try to extract SAP error details
-        const sapError = error.response?.data?.error?.message?.value || 
-                        error.response?.data?.error?.message ||
-                        error.message;
-
-        throw new Error(`SAP posting failed: ${sapError}`);
-      }
-
-    } else {
-      // On-prem
-      const path = '/sap/opu/odata/sap/API_SUPPLIERINVOICE/SupplierInvoiceSet';
-
-      try {
-        const { data } = await executeHttpRequest(
-          { destinationName: destName },
-          {
-            method: 'POST',
-            url: path,
-            headers: {
-              'Content-Type': 'application/json',
-              'Accept': 'application/json'
-            },
-            data: payload
-          }
-        );
-
-        return {
-          type: data.ReturnType || 'S',
-          document: data.InvoiceDocument,
-          fiscalYear: data.FiscalYear,
-          docType: 'RE',
-          message: data.Message || 'Invoice created',
-          messageClass: data.MessageClass,
-          messageNumber: data.MessageNumber,
-          fullResponse: data
-        };
-
-      } catch (error) {
-        LOG.error('SAP API Error (on-prem):', error);
-        throw new Error(`SAP posting failed: ${error.message}`);
-      }
-    }
+    return results
+      .filter(r => r.Supplier && r.BusinessPartnerIsBlocked !== 'X')
+      .map(row => mapSupplierRow(row));
   }
 
-  // ============================================
-  // HELPER: POST ACCOUNTING DOCUMENT
-  // ============================================
-  async function postAccountingDocument(header, destName, systemKind) {
-    LOG.info(`Posting accounting document to SAP (${systemKind})`);
+  /**
+   * Map supplier row - same structure for both cloud and on-prem
+   */
+  function mapSupplierRow(row) {
+    const lastChanged = parseODataV2Date(row.LastChangeDate) ||
+                       parseODataV2Date(row.CreationDate) ||
+                       new Date();
 
-    const payload = buildAccountingDocPayload(header);
-
-    if (systemKind === 'cloud') {
-      const path = '/API_JOURNALENTRY_SRV/A_JournalEntryBulkCreateRequest';
-
-      const { data } = await executeHttpRequest(
-        { destinationName: destName },
-        {
-          method: 'POST',
-          url: path,
-          headers: {
-            'Content-Type': 'application/json',
-            'Accept': 'application/json'
-          },
-          data: payload
-        }
-      );
-
-      return {
-        type: 'S',
-        document: data.AccountingDocument,
-        fiscalYear: data.FiscalYear,
-        docType: 'KR',
-        message: `Accounting document ${data.AccountingDocument} created`,
-        messageClass: '',
-        messageNumber: '',
-        fullResponse: data
-      };
-
-    } else {
-      const path = '/sap/opu/odata/sap/FAC_JOURNALENTRY/JournalEntryCreateRequest';
-
-      const { data } = await executeHttpRequest(
-        { destinationName: destName },
-        {
-          method: 'POST',
-          url: path,
-          headers: {
-            'Content-Type': 'application/json',
-            'Accept': 'application/json'
-          },
-          data: payload
-        }
-      );
-
-      return {
-        type: data.ReturnType || 'S',
-        document: data.AccountingDocument,
-        fiscalYear: data.FiscalYear,
-        docType: 'KR',
-        message: data.Message || 'Document created',
-        messageClass: data.MessageClass,
-        messageNumber: data.MessageNumber,
-        fullResponse: data
-      };
-    }
-  }
-
-  // ============================================
-  // BUILD SUPPLIER INVOICE PAYLOAD (FIXED)
-  // ============================================
-  function buildSupplierInvoicePayload(header) {
-    const items = [];
-
-    // Map DOX items to PO items
-    for (const doxItem of header.doxItems || []) {
-      if (doxItem.matchStatus !== 'MATCHED' || !doxItem.matchedPOItem_ID) {
-        continue;
-      }
-
-      const poItem = (header.poItems || []).find(pi => pi.ID === doxItem.matchedPOItem_ID);
-
-      if (!poItem) {
-        continue;
-      }
-
-      items.push({
-        SupplierInvoiceItem: String(items.length + 1).padStart(4, '0'),
-        PurchaseOrder: poItem.PurchaseOrder,
-        PurchaseOrderItem: poItem.PurchaseOrderItem,
-        Plant: poItem.Plant,
-        TaxCode: doxItem.taxCode || poItem.TaxCode || '',
-        DocumentCurrency: header.currencyCode,
-        SupplierInvoiceItemAmount: String(doxItem.netAmount),
-        QuantityInPurchaseOrderUnit: String(doxItem.quantity),
-        PurchaseOrderQuantityUnit: doxItem.unitOfMeasure || poItem.OrderUnit
-      });
-    }
-
-    // Convert dates to SAP OData v2 format: /Date(timestamp)/
-    const documentDate = formatDateForSAP(header.documentDate);
-    const postingDate = formatDateForSAP(new Date());
-    const dueDate = formatDateForSAP(header.documentDate);
-
-    // Map payment terms to SAP codes
-    const paymentTerms = mapPaymentTerms(header.paymentTerms);
-
-    // ⚠️ KEY FIX: Do NOT send InvoiceDocument and FiscalYear for CREATE
-    // SAP generates these values and returns them in the response
-    return {
-      CompanyCode: header.companyCode,
-      DocumentDate: documentDate,
-      PostingDate: postingDate,
-      InvoicingParty: header.matchedSupplierNumber,
-      DocumentCurrency: header.currencyCode,
-      InvoiceGrossAmount: String(header.grossAmount),
-      DueCalculationBaseDate: dueDate,
-      PaymentTerms: paymentTerms,
-      DocumentHeaderText: `Invoice ${header.documentNumber || 'AUTO'}`,
-      to_SuplrInvcItemPurOrdRef: items
-    };
-  }
-
-  // ============================================
-  // FORMAT DATE FOR SAP ODATA V2
-  // ============================================
-  function formatDateForSAP(dateValue) {
-    if (!dateValue) return null;
+    // Address handling - same for both cloud and on-prem
+    const addresses = row.to_BusinessPartnerAddress?.results || 
+                     row.to_BusinessPartnerAddress || 
+                     [];
     
-    let date;
-    if (typeof dateValue === 'string') {
-      date = new Date(dateValue);
-    } else if (dateValue instanceof Date) {
-      date = dateValue;
-    } else {
-      return null;
-    }
+    const primaryAddress = Array.isArray(addresses) 
+      ? (addresses.find(a => a.AddressID === '1') || addresses[0] || {})
+      : addresses;
 
-    // SAP OData v2 expects: /Date(timestamp)/
-    const timestamp = date.getTime();
-    return `/Date(${timestamp})/`;
-  }
-
-  // ============================================
-  // MAP PAYMENT TERMS TO SAP CODES
-  // ============================================
-  function mapPaymentTerms(invoiceTerms) {
-    if (!invoiceTerms) return '';
-
-    // Normalize the input
-    const normalized = invoiceTerms.trim().toUpperCase();
-
-    // Payment terms mapping - expand this as needed
-    const mappings = {
-      // Net terms
-      'NET 10': '0010',
-      'NET 10 EOM': '0010',
-      'NET 15': '0015',
-      'NET 30': '0030',
-      'NET 30 EOM': '0030',
-      'NET 45': '0045',
-      'NET 60': '0060',
-      'NET 90': '0090',
-      
-      // Due on receipt
-      'DUE ON RECEIPT': '0001',
-      'IMMEDIATE': '0001',
-      'PAYABLE IMMEDIATELY': '0001',
-      
-      // Common SAP codes (pass through)
-      '0001': '0001',
-      '0010': '0010',
-      '0015': '0015',
-      '0030': '0030',
-      '0045': '0045',
-      '0060': '0060',
-      '0090': '0090',
-      
-      // 2% 10 Net 30 variants
-      '2/10 NET 30': 'ZB01',
-      '2% 10 NET 30': 'ZB01',
-      
-      // Default
-      'DEFAULT': '0030'
-    };
-
-    // Try exact match first
-    if (mappings[normalized]) {
-      LOG.info(`Mapped payment terms: "${invoiceTerms}" → "${mappings[normalized]}"`);
-      return mappings[normalized];
-    }
-
-    // Try partial matches
-    if (normalized.includes('NET 10') || normalized.includes('N10')) {
-      LOG.info(`Mapped payment terms (partial): "${invoiceTerms}" → "0010"`);
-      return '0010';
-    }
-    if (normalized.includes('NET 15') || normalized.includes('N15')) {
-      LOG.info(`Mapped payment terms (partial): "${invoiceTerms}" → "0015"`);
-      return '0015';
-    }
-    if (normalized.includes('NET 30') || normalized.includes('N30')) {
-      LOG.info(`Mapped payment terms (partial): "${invoiceTerms}" → "0030"`);
-      return '0030';
-    }
-    if (normalized.includes('NET 45') || normalized.includes('N45')) {
-      LOG.info(`Mapped payment terms (partial): "${invoiceTerms}" → "0045"`);
-      return '0045';
-    }
-    if (normalized.includes('NET 60') || normalized.includes('N60')) {
-      LOG.info(`Mapped payment terms (partial): "${invoiceTerms}" → "0060"`);
-      return '0060';
-    }
-    if (normalized.includes('NET 90') || normalized.includes('N90')) {
-      LOG.info(`Mapped payment terms (partial): "${invoiceTerms}" → "0090"`);
-      return '0090';
-    }
-
-    // No match found - return empty string (SAP will use supplier default)
-    LOG.warn(`Payment terms not mapped: "${invoiceTerms}" - using empty string`);
-    return '';
-  }
-
-  // ============================================
-  // BUILD ACCOUNTING DOCUMENT PAYLOAD
-  // ============================================
-  function buildAccountingDocPayload(header) {
-    const items = [];
-
-    // Vendor item (credit)
-    items.push({
-      GLAccount: '',
-      AccountingDocumentItem: '001',
-      AccountingDocumentItemType: 'K',
-      Supplier: header.matchedSupplierNumber,
-      AmountInTransactionCurrency: header.grossAmount,
-      DebitCreditCode: 'H',
-      DocumentItemText: `Invoice ${header.documentNumber || 'AUTO'}`
-    });
-
-    // Line items (debit)
-    let itemNum = 2;
-    for (const doxItem of header.doxItems || []) {
-      items.push({
-        GLAccount: '400000',
-        AccountingDocumentItem: String(itemNum).padStart(3, '0'),
-        AmountInTransactionCurrency: doxItem.netAmount,
-        DebitCreditCode: 'S',
-        TaxCode: doxItem.taxCode,
-        DocumentItemText: doxItem.description || 'Invoice Item'
-      });
-      itemNum++;
-    }
-
-    // Tax item
-    if (header.taxAmount && header.taxAmount > 0) {
-      items.push({
-        GLAccount: '154000',
-        AccountingDocumentItem: String(itemNum).padStart(3, '0'),
-        AmountInTransactionCurrency: header.taxAmount,
-        DebitCreditCode: 'S',
-        TaxCode: header.doxItems?.[0]?.taxCode,
-        DocumentItemText: 'Tax'
-      });
-    }
+    const altNames = [
+      row.SearchTerm1,
+      row.SearchTerm2,
+      row.OrganizationBPName1,
+      row.OrganizationBPName2
+    ].filter(Boolean).join(' ').trim();
 
     return {
-      MessageHeader: {
-        CreationDateTime: new Date().toISOString()
-      },
-      JournalEntry: {
-        CompanyCode: header.companyCode,
-        DocumentDate: header.documentDate,
-        PostingDate: new Date().toISOString().split('T')[0],
-        DocumentHeaderText: `Invoice ${header.documentNumber || 'AUTO'}`,
-        DocumentReferenceID: header.documentNumber,
-        Items: items
-      }
+      supplierNumber: row.Supplier,
+      supplierName: row.BusinessPartnerFullName || row.BusinessPartnerName || '',
+      altNames: altNames || '',
+      
+      street: primaryAddress.StreetName || '',
+      city: primaryAddress.CityName || '',
+      postalCode: primaryAddress.PostalCode || '',
+      state: primaryAddress.Region || '',
+      country: primaryAddress.Country || '',
+      
+      isActive: true,
+      lastChangedAt: lastChanged
     };
+  }
+
+  function buildUrl(path, params) {
+    const url = new URL('http://dummy' + path);
+    Object.entries(params).forEach(([key, value]) => {
+      if (value !== undefined && value !== null) {
+        url.searchParams.set(key, value);
+      }
+    });
+    return url.pathname + url.search;
   }
 };

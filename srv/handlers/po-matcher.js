@@ -392,16 +392,15 @@ module.exports = function(srv) {
 
     const DEST_NAME = process.env.S4_DEST_NAME || 'S4HANA';
     const SAP_CLIENT = process.env.S4_CLIENT || '100';
-    const SYSTEM_KIND = process.env.S4_KIND || 'onprem'; // ✅ FIXED: Default to onprem
 
     try {
-      // Fetch PO items - NO GUESSING, use metadata-based approach
-      const poItems = await fetchPOItemsFromSAP(DEST_NAME, SAP_CLIENT, poNumber, SYSTEM_KIND);
+      // ✅ Fetch PO items using API_PURCHASEORDER_PROCESS_SRV
+      const poItems = await fetchPOItemsFromSAP(DEST_NAME, SAP_CLIENT, poNumber);
 
       LOG.info(`Fetched ${poItems.length} PO items from SAP`);
 
       // Upsert PO items
-      const itemsData = poItems.map(item => mapPOItem(item, SYSTEM_KIND, headerId));
+      const itemsData = poItems.map(item => mapPOItem(item, headerId));
 
       for (const item of itemsData) {
         const key = {
@@ -425,24 +424,33 @@ module.exports = function(srv) {
         data: { headerId }
       });
 
-      // Fetch GR data - ON-PREM ONLY (no cloud fallback)
-      const grData = await fetchGRDataFromSAP(DEST_NAME, SAP_CLIENT, poNumber, SYSTEM_KIND);
+      // ✅ Fetch schedule lines to get delivery dates
+      const scheduleLines = await fetchScheduleLinesFromSAP(DEST_NAME, SAP_CLIENT, poNumber);
+      
+      LOG.info(`Fetched ${scheduleLines.length} schedule lines from SAP`);
 
-      LOG.info(`Fetched ${grData.length} GR records from SAP`);
+      // Update PO items with delivery dates from schedule lines
+      for (const scheduleLine of scheduleLines) {
+        const key = {
+          PurchaseOrder: scheduleLine.PurchasingDocument,
+          PurchaseOrderItem: scheduleLine.PurchasingDocumentItem,
+          invoiceHeader_ID: headerId
+        };
 
-      let grSynced = 0;
-      if (grData.length > 0) {
-        grSynced = await srv.send({
-          event: 'UpsertGRSnapshots',
-          data: { data: JSON.stringify({ headerId, items: grData }) }
-        });
+        const poItem = await tx.read(SAPPOItem).where(key);
+
+        if (poItem && poItem.length > 0) {
+          await tx.update(SAPPOItem).set({
+            DeliveryDate: scheduleLine.ScheduleLineDeliveryDate
+          }).where({ ID: poItem[0].ID });
+        }
       }
 
-      LOG.info(`PO sync completed: ${poItems.length} items, ${grSynced} GR records`);
+      LOG.info(`PO sync completed: ${poItems.length} items with delivery dates`);
 
       return {
         itemsSynced: poItems.length,
-        grDataSynced: grSynced
+        scheduleLinesProcessed: scheduleLines.length
       };
 
     } catch (error) {
@@ -463,7 +471,7 @@ module.exports = function(srv) {
       return;
     }
 
-    const { headerId, items = [], systemKind = 'onprem' } = payload; // ✅ FIXED: Default to onprem
+    const { headerId, items = [] } = payload;
 
     if (!headerId || !items.length) {
       req.error(400, 'headerId and items are required');
@@ -474,7 +482,7 @@ module.exports = function(srv) {
     let upserted = 0;
 
     for (const item of items) {
-      const row = mapPOItem(item, systemKind, headerId);
+      const row = mapPOItem(item, headerId);
 
       const key = {
         PurchaseOrder: row.PurchaseOrder,
@@ -596,50 +604,47 @@ module.exports = function(srv) {
   });
 
   // ============================================
-  // HELPERS - FIXED FOR ON-PREM BASED ON YOUR METADATA
+  // HELPERS - FIXED: Uses ONLY API_PURCHASEORDER_PROCESS_SRV
   // ============================================
 
   /**
-   * ✅ Fetch PO items - supports both on-prem (default) and cloud
+   * ✅ FIXED: Fetch PO items using API_PURCHASEORDER_PROCESS_SRV
+   * Works for both on-prem and cloud (same service, same metadata)
    */
-  async function fetchPOItemsFromSAP(destName, client, poNumber, systemKind) {
-    let path, filter, select, url;
+  async function fetchPOItemsFromSAP(destName, client, poNumber) {
+    const path = '/sap/opu/odata/sap/API_PURCHASEORDER_PROCESS_SRV/A_PurchaseOrderItem';
+    const filter = `PurchaseOrder eq '${poNumber}'`;
+    
+    // ✅ Fields from YOUR metadata - NO ScheduleLineDeliveryDate here!
+    const select = [
+      'PurchaseOrder',
+      'PurchaseOrderItem',
+      'Material',
+      'PurchaseOrderItemText',
+      'OrderQuantity',
+      'PurchaseOrderQuantityUnit',
+      'NetPriceAmount',
+      'NetPriceQuantity',
+      'OrderPriceUnit',
+      'TaxCode',
+      'DocumentCurrency',
+      'Plant',
+      'StorageLocation',
+      'GoodsReceiptIsExpected',
+      'InvoiceIsExpected',
+      'InvoiceIsGoodsReceiptBased',
+      'AccountAssignmentCategory',
+      'PurchaseOrderItemCategory'
+    ].join(',');
 
-    if (systemKind === 'cloud') {
-      // CLOUD: API_PURCHASEORDER_PROCESS_SRV (SAP S/4HANA Cloud)
-      path = '/API_PURCHASEORDER_PROCESS_SRV/A_PurchaseOrderItem';
-      filter = `PurchaseOrder eq '${poNumber}'`;
-      select = [
-        'PurchaseOrder', 'PurchaseOrderItem', 'Material', 'PurchaseOrderItemText',
-        'OrderQuantity', 'PurchaseOrderQuantityUnit', 'NetPriceAmount',
-        'NetPriceQuantity', 'OrderPriceUnit', 'TaxCode', 'DocumentCurrency',
-        'Plant', 'StorageLocation', 'ScheduleLineDeliveryDate',
-        'GoodsReceiptIsExpected', 'InvoiceIsExpected', 'InvoiceIsGoodsReceiptBased',
-        'AccountAssignmentCategory', 'PurchaseOrderItemCategory'
-      ].join(',');
+    const url = buildUrl(path, {
+      $filter: filter,
+      $select: select,
+      'sap-client': client,
+      $format: 'json'
+    });
 
-      url = buildUrl(path, {
-        $filter: filter,
-        $select: select,
-        'sap-client': client,
-        $format: 'json'
-      });
-
-      LOG.info(`Fetching PO items from cloud: ${url}`);
-
-    } else {
-      // ON-PREM (DEFAULT): MM_PUR_PO_MAINT_V2 service
-      path = '/sap/opu/odata/sap/MM_PUR_PO_MAINT_V2/C_PurchaseOrderItemTP';
-      filter = `PurchaseOrder eq '${poNumber}'`;
-
-      url = buildUrl(path, {
-        $filter: filter,
-        'sap-client': client,
-        $format: 'json'
-      });
-
-      LOG.info(`Fetching PO items from on-prem: ${url}`);
-    }
+    LOG.info(`Fetching PO items: ${url}`);
 
     const { data } = await executeHttpRequest(
       { destinationName: destName },
@@ -650,30 +655,37 @@ module.exports = function(srv) {
       }
     );
 
-    // Both cloud and on-prem return data.d.results or data.value
     return data?.d?.results || data?.value || [];
   }
 
   /**
-   * ✅ FIXED: Fetch GR data from on-prem SAP
-   * Based on your metadata - typically MaterialDocument service
+   * ✅ NEW: Fetch schedule lines to get delivery dates
+   * Uses A_PurchaseOrderScheduleLine from YOUR metadata
    */
-  async function fetchGRDataFromSAP(destName, client, poNumber, systemKind) {
-    // For on-prem, GR data comes from MaterialDocument service
-    // This is a placeholder - adjust based on your actual metadata
-    const path = '/sap/opu/odata/sap/API_MATERIAL_DOCUMENT/A_MaterialDocumentItem';
+  async function fetchScheduleLinesFromSAP(destName, client, poNumber) {
+    const path = '/sap/opu/odata/sap/API_PURCHASEORDER_PROCESS_SRV/A_PurchaseOrderScheduleLine';
+    const filter = `PurchasingDocument eq '${poNumber}'`;
     
-    const filter = `PurchaseOrder eq '${poNumber}'`;
+    // ✅ Fields from YOUR metadata
+    const select = [
+      'PurchasingDocument',
+      'PurchasingDocumentItem',
+      'ScheduleLine',
+      'ScheduleLineDeliveryDate',
+      'ScheduleLineOrderQuantity',
+      'PurchaseOrderQuantityUnit'
+    ].join(',');
 
     const url = buildUrl(path, {
       $filter: filter,
+      $select: select,
       'sap-client': client,
       $format: 'json'
     });
 
+    LOG.info(`Fetching schedule lines: ${url}`);
+
     try {
-      LOG.info(`Fetching GR data from on-prem: ${url}`);
-      
       const { data } = await executeHttpRequest(
         { destinationName: destName },
         { 
@@ -683,44 +695,38 @@ module.exports = function(srv) {
         }
       );
 
-      return data?.d?.results || [];
+      return data?.d?.results || data?.value || [];
     } catch (error) {
-      LOG.warn(`GR data fetch failed (non-critical): ${error.message}`);
-      return []; // GR data is optional
+      LOG.warn(`Could not fetch schedule lines: ${error.message}`);
+      return [];
     }
   }
 
   /**
-   * Map PO item from SAP response to internal format
-   * ✅ FIXED: Use on-prem field names from your metadata
+   * ✅ Map PO item from SAP response to internal format
    */
-  function mapPOItem(raw, systemKind, headerId) {
+  function mapPOItem(raw, headerId) {
     return {
-      PurchaseOrder: raw.PurchaseOrder || raw.EBELN,
-      PurchaseOrderItem: raw.PurchaseOrderItem || raw.EBELP,
-      PurchaseOrderItemCategory: raw.PurchaseOrderItemCategory || raw.PSTYP,
-      Material: raw.Material || raw.MATNR,
-      MaterialName: raw.PurchaseOrderItemText || raw.TXZ01,
-      Plant: raw.Plant || raw.WERKS,
-      StorageLocation: raw.StorageLocation || raw.LGORT,
-      OrderQuantity: toNumber(raw.OrderQuantity || raw.MENGE, 3),
-      OrderUnit: raw.PurchaseOrderQuantityUnit || raw.MEINS,
-      OpenQuantity: toNumber(raw.OrderQuantity || raw.MENGE, 3), // Will be updated by GR sync
-      NetPriceAmount: toNumber(raw.NetPriceAmount || raw.NETPR, 2),
-      NetPriceQuantity: toNumber(raw.NetPriceQuantity || raw.PEINH, 3),
-      NetPriceQuantityUnit: raw.OrderPriceUnit || raw.BPRME,
-      Currency: raw.DocumentCurrency || raw.WAERS,
-      TaxCode: raw.TaxCode || raw.MWSKZ,
-      DeliveryDate: raw.ScheduleLineDeliveryDate || raw.EINDT,
-      GoodsReceiptIsExpected: toBoolean(raw.GoodsReceiptIsExpected || raw.WEBRE),
-      InvoiceIsExpected: toBoolean(raw.InvoiceIsExpected || raw.EREKZ),
-      InvoiceIsGoodsReceiptBased: toBoolean(raw.InvoiceIsGoodsReceiptBased || raw.WEBRE),
-      AccountAssignmentCategory: raw.AccountAssignmentCategory || raw.KNTTP,
-      GLAccount: raw.GLAccount || raw.SAKTO,
-      CostCenter: raw.CostCenter || raw.KOSTL,
-      ServicePackage: raw.ServicePackage || raw.SRVPOS,
-      ExpectedOverallLimitAmount: toNumber(raw.ExpectedOverallLimitAmount, 2),
-      OverallLimitAmount: toNumber(raw.OverallLimitAmount, 2),
+      PurchaseOrder: raw.PurchaseOrder,
+      PurchaseOrderItem: raw.PurchaseOrderItem,
+      PurchaseOrderItemCategory: raw.PurchaseOrderItemCategory,
+      Material: raw.Material,
+      MaterialName: raw.PurchaseOrderItemText,
+      Plant: raw.Plant,
+      StorageLocation: raw.StorageLocation,
+      OrderQuantity: toNumber(raw.OrderQuantity, 3),
+      OrderUnit: raw.PurchaseOrderQuantityUnit,
+      OpenQuantity: toNumber(raw.OrderQuantity, 3), // Will be updated by GR sync
+      NetPriceAmount: toNumber(raw.NetPriceAmount, 2),
+      NetPriceQuantity: toNumber(raw.NetPriceQuantity, 3),
+      NetPriceQuantityUnit: raw.OrderPriceUnit,
+      Currency: raw.DocumentCurrency,
+      TaxCode: raw.TaxCode,
+      DeliveryDate: null, // Will be set from schedule lines
+      GoodsReceiptIsExpected: toBoolean(raw.GoodsReceiptIsExpected),
+      InvoiceIsExpected: toBoolean(raw.InvoiceIsExpected),
+      InvoiceIsGoodsReceiptBased: toBoolean(raw.InvoiceIsGoodsReceiptBased),
+      AccountAssignmentCategory: raw.AccountAssignmentCategory,
       GrQuantityPosted: 0,
       invoiceHeader_ID: headerId
     };
