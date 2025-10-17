@@ -171,59 +171,90 @@ module.exports = function(srv) {
 
     const payload = buildSupplierInvoicePayload(header);
 
+    // Log payload for debugging
+    LOG.info('Posting payload:', JSON.stringify(payload, null, 2));
+
     if (systemKind === 'cloud') {
       const path = '/API_SUPPLIERINVOICE_PROCESS_SRV/A_SupplierInvoice';
 
-      const { data } = await executeHttpRequest(
-        { destinationName: destName },
-        {
-          method: 'POST',
-          url: path,
-          headers: {
-            'Content-Type': 'application/json',
-            'Accept': 'application/json'
-          },
-          data: payload
-        }
-      );
+      try {
+        const { data } = await executeHttpRequest(
+          { destinationName: destName },
+          {
+            method: 'POST',
+            url: path,
+            headers: {
+              'Content-Type': 'application/json',
+              'Accept': 'application/json'
+            },
+            data: payload
+          }
+        );
 
-      return {
-        type: 'S',
-        document: data.SupplierInvoice,
-        fiscalYear: data.FiscalYear,
-        docType: 'RE',
-        message: `Supplier invoice ${data.SupplierInvoice} created`,
-        messageClass: '',
-        messageNumber: '',
-        fullResponse: data
-      };
+        // Handle different response formats (OData v2 wraps in 'd')
+        const result = data?.d || data;
+
+        LOG.info('SAP Response:', JSON.stringify(result, null, 2));
+
+        return {
+          type: 'S',
+          document: result.SupplierInvoice,
+          fiscalYear: result.FiscalYear,
+          docType: 'RE',
+          message: `Supplier invoice ${result.SupplierInvoice} created successfully`,
+          messageClass: '',
+          messageNumber: '',
+          fullResponse: data
+        };
+
+      } catch (error) {
+        LOG.error('SAP API Error:', {
+          message: error.message,
+          response: error.response?.data,
+          status: error.response?.status
+        });
+
+        // Try to extract SAP error details
+        const sapError = error.response?.data?.error?.message?.value || 
+                        error.response?.data?.error?.message ||
+                        error.message;
+
+        throw new Error(`SAP posting failed: ${sapError}`);
+      }
 
     } else {
+      // On-prem
       const path = '/sap/opu/odata/sap/API_SUPPLIERINVOICE/SupplierInvoiceSet';
 
-      const { data } = await executeHttpRequest(
-        { destinationName: destName },
-        {
-          method: 'POST',
-          url: path,
-          headers: {
-            'Content-Type': 'application/json',
-            'Accept': 'application/json'
-          },
-          data: payload
-        }
-      );
+      try {
+        const { data } = await executeHttpRequest(
+          { destinationName: destName },
+          {
+            method: 'POST',
+            url: path,
+            headers: {
+              'Content-Type': 'application/json',
+              'Accept': 'application/json'
+            },
+            data: payload
+          }
+        );
 
-      return {
-        type: data.ReturnType || 'S',
-        document: data.InvoiceDocument,
-        fiscalYear: data.FiscalYear,
-        docType: 'RE',
-        message: data.Message || 'Invoice created',
-        messageClass: data.MessageClass,
-        messageNumber: data.MessageNumber,
-        fullResponse: data
-      };
+        return {
+          type: data.ReturnType || 'S',
+          document: data.InvoiceDocument,
+          fiscalYear: data.FiscalYear,
+          docType: 'RE',
+          message: data.Message || 'Invoice created',
+          messageClass: data.MessageClass,
+          messageNumber: data.MessageNumber,
+          fullResponse: data
+        };
+
+      } catch (error) {
+        LOG.error('SAP API Error (on-prem):', error);
+        throw new Error(`SAP posting failed: ${error.message}`);
+      }
     }
   }
 
@@ -292,7 +323,7 @@ module.exports = function(srv) {
   }
 
   // ============================================
-  // BUILD SUPPLIER INVOICE PAYLOAD
+  // BUILD SUPPLIER INVOICE PAYLOAD (FIXED)
   // ============================================
   function buildSupplierInvoicePayload(header) {
     const items = [];
@@ -314,25 +345,25 @@ module.exports = function(srv) {
         PurchaseOrder: poItem.PurchaseOrder,
         PurchaseOrderItem: poItem.PurchaseOrderItem,
         Plant: poItem.Plant,
-        TaxCode: doxItem.taxCode || poItem.TaxCode,
+        TaxCode: doxItem.taxCode || poItem.TaxCode || '',
         DocumentCurrency: header.currencyCode,
-        SupplierInvoiceItemAmount: doxItem.netAmount,
-        QuantityInPurchaseOrderUnit: doxItem.quantity,
+        SupplierInvoiceItemAmount: String(doxItem.netAmount),
+        QuantityInPurchaseOrderUnit: String(doxItem.quantity),
         PurchaseOrderQuantityUnit: doxItem.unitOfMeasure || poItem.OrderUnit
       });
     }
 
+    // ⚠️ KEY FIX: Do NOT send InvoiceDocument and FiscalYear for CREATE
+    // SAP generates these values and returns them in the response
     return {
-      InvoiceDocument: '',
-      FiscalYear: '',
       CompanyCode: header.companyCode,
       DocumentDate: header.documentDate,
       PostingDate: new Date().toISOString().split('T')[0],
       InvoicingParty: header.matchedSupplierNumber,
       DocumentCurrency: header.currencyCode,
-      InvoiceGrossAmount: header.grossAmount,
+      InvoiceGrossAmount: String(header.grossAmount),
       DueCalculationBaseDate: header.documentDate,
-      PaymentTerms: header.paymentTerms,
+      PaymentTerms: header.paymentTerms || '',
       DocumentHeaderText: `Invoice ${header.documentNumber || 'AUTO'}`,
       to_SuplrInvcItemPurOrdRef: items
     };

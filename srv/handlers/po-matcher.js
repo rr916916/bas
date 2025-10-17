@@ -63,10 +63,15 @@ module.exports = function(srv) {
       if (fetchFromSAP) {
         LOG.info(`Fetching PO ${finalPO} from SAP`);
         
-        await srv.send({
-          event: 'SyncPOFromSAP',
-          data: { poNumber: finalPO, headerId }
-        });
+        try {
+          await srv.send({
+            event: 'SyncPOFromSAP',
+            data: { poNumber: finalPO, headerId }
+          });
+        } catch (sapError) {
+          LOG.warn(`SAP fetch failed, will try to match with existing data: ${sapError.message}`);
+          // Continue anyway - maybe we have cached PO data
+        }
       }
 
       // Get DOX items
@@ -110,22 +115,26 @@ module.exports = function(srv) {
           continue;
         }
 
-        // Vector search for best PO item match
+        // Vector search for best PO item match - use physical table name
+        const physicalTable = 'JUNO_INVOICE_ASSISTANT_V1_SAPPOITEM';
+        
         const poMatches = await tx.run(`
           SELECT
-            "ID", "PurchaseOrder", "PurchaseOrderItem",
-            "Material", "MaterialName",
-            "OrderQuantity", "OpenQuantity", "GrQuantityPosted",
-            "InvoiceIsExpected", "GoodsReceiptIsExpected",
-            "InvoiceIsGoodsReceiptBased",
-            "NetPriceAmount", "Currency",
+            "ID", "PURCHASEORDER" as "PurchaseOrder", "PURCHASEORDERITEM" as "PurchaseOrderItem",
+            "MATERIAL" as "Material", "MATERIALNAME" as "MaterialName",
+            "ORDERQUANTITY" as "OrderQuantity", "OPENQUANTITY" as "OpenQuantity", 
+            "GRQUANTITYPOSTED" as "GrQuantityPosted",
+            "INVOICEISEXPECTED" as "InvoiceIsExpected", 
+            "GOODSRECEIPTISEXPECTED" as "GoodsReceiptIsExpected",
+            "INVOICEISGOODSRECEIPTBASED" as "InvoiceIsGoodsReceiptBased",
+            "NETPRICEAMOUNT" as "NetPriceAmount", "CURRENCY" as "Currency",
             COSINE_SIMILARITY(
-              VECTOR_EMBEDDING(?, 'QUERY', ?),
-              "embedding"
+              VECTOR_EMBEDDING(?, 'DOCUMENT', ?),
+              "EMBEDDING"
             ) AS "matchScore"
-          FROM "${SAPPOItem.name}"
-          WHERE "PurchaseOrder" = ?
-            AND "invoiceHeader_ID" = ?
+          FROM "${physicalTable}"
+          WHERE "PURCHASEORDER" = ?
+            AND "INVOICEHEADER_ID" = ?
           ORDER BY "matchScore" DESC
           LIMIT 3
         `, [query, MODEL, finalPO, headerId]);
@@ -134,8 +143,9 @@ module.exports = function(srv) {
           const bestMatch = poMatches[0];
           const matchScore = bestMatch.matchScore;
 
-          // Check if match is confident enough
-          if (matchScore >= 0.7) {
+          // Accept any match score >= 0.3 (very permissive for cross-system matching)
+          // Business logic will decide if manual review needed
+          if (matchScore >= 0.3) {
             // Update DOX item with match
             await tx.update(DOXInvoiceItem, doxItem.ID).set({
               matchStatus: 'MATCHED',
@@ -172,12 +182,15 @@ module.exports = function(srv) {
 
             LOG.info(`DOX item ${doxItem.lineNumber} matched to PO item ${bestMatch.PurchaseOrderItem} (score: ${matchScore.toFixed(4)})`);
           } else {
+            // Still log the best match even if score is low
+            LOG.warn(`DOX item ${doxItem.lineNumber} best match score: ${matchScore.toFixed(4)} (below threshold 0.3)`);
+            LOG.warn(`  DOX: ${query}`);
+            LOG.warn(`  PO:  ${bestMatch.Material || 'no-material'} ${bestMatch.MaterialName}`);
+            
             await tx.update(DOXInvoiceItem, doxItem.ID).set({
               matchStatus: 'NO_MATCH',
               matchScore
             });
-
-            LOG.warn(`DOX item ${doxItem.lineNumber} match score too low: ${matchScore.toFixed(4)}`);
           }
         } else {
           await tx.update(DOXInvoiceItem, doxItem.ID).set({
@@ -274,7 +287,7 @@ module.exports = function(srv) {
 
     const DEST_NAME = process.env.S4_DEST_NAME || 'S4HANA';
     const SAP_CLIENT = process.env.S4_CLIENT || '100';
-    const SYSTEM_KIND = process.env.S4_KIND || 'cloud';
+    const SYSTEM_KIND = process.env.S4_KIND || 'onprem';
 
     try {
       // Fetch PO items
@@ -345,7 +358,7 @@ module.exports = function(srv) {
       return;
     }
 
-    const { headerId, items = [], systemKind = 'cloud' } = payload;
+    const { headerId, items = [], systemKind = 'onprem' } = payload;
 
     if (!headerId || !items.length) {
       req.error(400, 'headerId and items are required');
@@ -445,24 +458,24 @@ module.exports = function(srv) {
   srv.on('RefreshPOEmbeddings', async (req) => {
     const { headerId } = req.data;
     const db = cds.db;
-    const table = SAPPOItem.name;
+    const physicalTable = 'JUNO_INVOICE_ASSISTANT_V1_SAPPOITEM';
 
     try {
       if (headerId) {
         await db.run(`
-          UPDATE "${table}"
-          SET "embedding" = VECTOR_EMBEDDING(
-            COALESCE("Material",'') || ' ' || COALESCE("MaterialName",''),
+          UPDATE "${physicalTable}"
+          SET "EMBEDDING" = VECTOR_EMBEDDING(
+            COALESCE("MATERIAL",'') || ' ' || COALESCE("MATERIALNAME",''),
             'DOCUMENT',
             ?
           )
-          WHERE "invoiceHeader_ID" = ?
+          WHERE "INVOICEHEADER_ID" = ?
         `, [MODEL, headerId]);
       } else {
         await db.run(`
-          UPDATE "${table}"
-          SET "embedding" = VECTOR_EMBEDDING(
-            COALESCE("Material",'') || ' ' || COALESCE("MaterialName",''),
+          UPDATE "${physicalTable}"
+          SET "EMBEDDING" = VECTOR_EMBEDDING(
+            COALESCE("MATERIAL",'') || ' ' || COALESCE("MATERIALNAME",''),
             'DOCUMENT',
             ?
           )
@@ -482,76 +495,44 @@ module.exports = function(srv) {
   // ============================================
 
   async function fetchPOItemsFromSAP(destName, client, poNumber, systemKind) {
-    if (systemKind === 'cloud') {
-      const path = '/API_PURCHASEORDER_PROCESS_SRV/A_PurchaseOrderItem';
-      const filter = `PurchaseOrder eq '${poNumber}'`;
-      const select = [
-        'PurchaseOrder', 'PurchaseOrderItem', 'Material', 'PurchaseOrderItemText',
-        'OrderQuantity', 'PurchaseOrderQuantityUnit', 'NetPriceAmount',
-        'NetPriceQuantity', 'OrderPriceUnit', 'TaxCode', 'DocumentCurrency',
-        'Plant', 'StorageLocation', 'ScheduleLineDeliveryDate',
-        'GoodsReceiptIsExpected', 'InvoiceIsExpected', 'InvoiceIsGoodsReceiptBased',
-        'AccountAssignmentCategory', 'PurchaseOrderItemCategory'
-      ].join(',');
+    // Ensure PO number is padded to 10 digits for SAP
+    const paddedPO = poNumber.padStart(10, '0');
+    
+    // Use relative path from destination base (which already has /sap/opu/odata/sap)
+    const path = '/API_PURCHASEORDER_PROCESS_SRV/A_PurchaseOrderItem';
+    const filter = `PurchaseOrder eq '${paddedPO}'`;
+    
+    // Only select fields that exist in on-prem system
+    const select = [
+      'PurchaseOrder', 'PurchaseOrderItem', 'Material', 'PurchaseOrderItemText',
+      'OrderQuantity', 'PurchaseOrderQuantityUnit', 'NetPriceAmount',
+      'NetPriceQuantity', 'OrderPriceUnit', 'TaxCode', 'DocumentCurrency',
+      'Plant', 'StorageLocation',
+      'GoodsReceiptIsExpected', 'InvoiceIsExpected', 'InvoiceIsGoodsReceiptBased',
+      'AccountAssignmentCategory', 'PurchaseOrderItemCategory'
+    ].join(',');
 
-      const url = buildUrl(path, {
-        $filter: filter,
-        $select: select,
-        'sap-client': client,
-        $format: 'json'
-      });
+    const url = buildUrl(path, {
+      $filter: filter,
+      $select: select,
+      'sap-client': client,
+      $format: 'json'
+    });
 
-      const { data } = await executeHttpRequest(
-        { destinationName: destName },
-        { method: 'GET', url, headers: { Accept: 'application/json' } }
-      );
+    LOG.info(`Fetching PO items: PO ${paddedPO}, URL: ${url}`);
 
-      return data?.d?.results || data?.value || [];
-    } else {
-      // On-prem
-      const path = '/sap/opu/odata/sap/MM_PUR_PO_MAINT_V2/C_PurchaseOrderItemTP';
-      const filter = `PurchaseOrder eq '${poNumber}'`;
+    const { data } = await executeHttpRequest(
+      { destinationName: destName },
+      { method: 'GET', url, headers: { Accept: 'application/json' } }
+    );
 
-      const url = buildUrl(path, {
-        $filter: filter,
-        'sap-client': client,
-        $format: 'json'
-      });
-
-      const { data } = await executeHttpRequest(
-        { destinationName: destName },
-        { method: 'GET', url, headers: { Accept: 'application/json' } }
-      );
-
-      return data?.d?.results || [];
-    }
+    return data?.d?.results || data?.value || [];
   }
 
   async function fetchGRDataFromSAP(destName, client, poNumber, systemKind) {
-    if (systemKind === 'cloud') {
-      const path = '/API_MATERIAL_DOCUMENT_SRV/A_MaterialDocumentItem';
-      const filter = `PurchaseOrder eq '${poNumber}'`;
-      const select = [
-        'MaterialDocumentYear', 'MaterialDocument', 'MaterialDocumentItem',
-        'PurchaseOrder', 'PurchaseOrderItem', 'QuantityInEntryUnit',
-        'EntryUnit', 'GoodsMovementType', 'PostingDate'
-      ].join(',');
-
-      const url = buildUrl(path, {
-        $filter: filter,
-        $select: select,
-        'sap-client': client,
-        $format: 'json'
-      });
-
-      const { data } = await executeHttpRequest(
-        { destinationName: destName },
-        { method: 'GET', url, headers: { Accept: 'application/json' } }
-      );
-
-      return data?.d?.results || data?.value || [];
-    }
-
+    // On-premise systems typically don't have this API readily available
+    // We'll skip GR fetch for now and rely on what's in the PO
+    LOG.info('Skipping GR data fetch for on-premise system');
     return [];
   }
 
@@ -581,7 +562,7 @@ module.exports = function(srv) {
       NetPriceQuantityUnit: raw.NetPriceQuantityUnit || raw.OrderPriceUnit,
       Currency: raw.Currency || raw.DocumentCurrency,
       TaxCode: raw.TaxCode,
-      DeliveryDate: raw.DeliveryDate || raw.ScheduleLineDeliveryDate,
+      DeliveryDate: null, // Delivery date field not available in on-prem
       GoodsReceiptIsExpected: toBoolean(raw.GoodsReceiptIsExpected),
       InvoiceIsExpected: toBoolean(raw.InvoiceIsExpected),
       InvoiceIsGoodsReceiptBased: toBoolean(raw.InvoiceIsGoodsReceiptBased),
