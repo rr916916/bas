@@ -604,18 +604,18 @@ module.exports = function(srv) {
   });
 
   // ============================================
-  // HELPERS - FIXED: Uses ONLY API_PURCHASEORDER_PROCESS_SRV
+  // HELPERS - FIXED: Correct URL paths
   // ============================================
 
   /**
-   * ✅ FIXED: Fetch PO items using API_PURCHASEORDER_PROCESS_SRV
-   * Works for both on-prem and cloud (same service, same metadata)
+   * ✅ FIXED: Fetch PO items - correct path from destination base
    */
   async function fetchPOItemsFromSAP(destName, client, poNumber) {
-    const path = '/sap/opu/odata/sap/API_PURCHASEORDER_PROCESS_SRV/A_PurchaseOrderItem';
+    // Destination base: https://vhcals4hci.resolvetech.com/sap/opu/odata/sap
+    // We need to add: /API_PURCHASEORDER_PROCESS_SRV/A_PurchaseOrderItem
+    const path = '/API_PURCHASEORDER_PROCESS_SRV/A_PurchaseOrderItem';
     const filter = `PurchaseOrder eq '${poNumber}'`;
     
-    // ✅ Fields from YOUR metadata - NO ScheduleLineDeliveryDate here!
     const select = [
       'PurchaseOrder',
       'PurchaseOrderItem',
@@ -659,14 +659,12 @@ module.exports = function(srv) {
   }
 
   /**
-   * ✅ NEW: Fetch schedule lines to get delivery dates
-   * Uses A_PurchaseOrderScheduleLine from YOUR metadata
+   * ✅ FIXED: Fetch schedule lines - correct path from destination base
    */
   async function fetchScheduleLinesFromSAP(destName, client, poNumber) {
-    const path = '/sap/opu/odata/sap/API_PURCHASEORDER_PROCESS_SRV/A_PurchaseOrderScheduleLine';
+    const path = '/API_PURCHASEORDER_PROCESS_SRV/A_PurchaseOrderScheduleLine';
     const filter = `PurchasingDocument eq '${poNumber}'`;
     
-    // ✅ Fields from YOUR metadata
     const select = [
       'PurchasingDocument',
       'PurchasingDocumentItem',

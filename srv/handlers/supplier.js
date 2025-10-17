@@ -356,17 +356,17 @@ module.exports = function(srv) {
   });
 
   // ============================================
-  // HELPERS - FIXED: Uses ONLY API_BUSINESS_PARTNER
+  // HELPERS - FIXED: Correct URL path
   // ============================================
   
   /**
-   * ✅ FIXED: Fetch suppliers using API_BUSINESS_PARTNER
-   * Works for both on-prem and cloud (same service, same metadata)
+   * ✅ FIXED: Fetch suppliers - correct path from destination base
    */
   async function fetchSuppliersFromSAP(destName, client, mode, since) {
-    const PATH = '/sap/opu/odata/sap/API_BUSINESS_PARTNER/A_BusinessPartner';
+    // Destination base: https://vhcals4hci.resolvetech.com/sap/opu/odata/sap
+    // We need to add: /API_BUSINESS_PARTNER/A_BusinessPartner
+    const PATH = '/API_BUSINESS_PARTNER/A_BusinessPartner';
     
-    // ✅ Fields from YOUR metadata
     const SELECT = [
       'BusinessPartner',
       'BusinessPartnerFullName',
