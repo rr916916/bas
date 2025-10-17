@@ -232,19 +232,26 @@ entity InvoiceProcessLog : cuid, managed {
 }
 
 // ============================================
-// SUPPLIER VECTOR
+// SUPPLIER VECTOR - ENHANCED WITH ADDRESS
 // ============================================
 entity SupplierVector : managed {
   key supplierNumber : String(10)   @title: 'Supplier Number';
   
+  // Name fields
   supplierName       : String(120)  @title: 'Supplier Name';
   altNames           : String(500)  @title: 'Alternative Names';
-  country            : String(3)    @title: 'Country';
+  
+  // Address fields for geographic matching
+  street             : String(60)   @title: 'Street';
   city               : String(40)   @title: 'City';
+  postalCode         : String(10)   @title: 'Postal Code';
+  state              : String(3)    @title: 'State/Region';
+  country            : String(3)    @title: 'Country';
   
   isActive           : Boolean      @title: 'Active' default true;
   lastChangedAt      : Timestamp    @title: 'Last Changed';
   
+  // Vector embedding (name-based only)
   embedding          : Vector;
   lastRefreshed      : Timestamp    @title: 'Embedding Refreshed';
 }

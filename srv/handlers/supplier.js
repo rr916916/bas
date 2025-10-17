@@ -10,7 +10,7 @@ module.exports = function(srv) {
   const { InvoiceHeader, SupplierVector } = srv.entities;
 
   // ============================================
-  // MATCH SUPPLIER
+  // MATCH SUPPLIER - WITH GEOGRAPHIC BOOST
   // ============================================
   srv.on('MatchSupplier', async (req) => {
     const { headerId } = req.data;
@@ -22,9 +22,10 @@ module.exports = function(srv) {
 
     const tx = cds.tx(req);
 
-    // Get invoice header
+    // Get invoice header with all address fields
     const header = await tx.read(InvoiceHeader, headerId, [
-      'ID', 'senderName', 'receiverName', 'senderAddress', 'senderCity'
+      'ID', 'senderName', 'receiverName', 'senderAddress', 
+      'senderCity', 'senderState', 'senderPostalCode'
     ]);
 
     if (!header) {
@@ -58,24 +59,33 @@ module.exports = function(srv) {
     }
 
     LOG.info(`Matching supplier for invoice ${headerId}: "${supplierName}"`);
+    if (header.senderCity) LOG.info(`  City: ${header.senderCity}`);
+    if (header.senderState) LOG.info(`  State: ${header.senderState}`);
+    if (header.senderPostalCode) LOG.info(`  ZIP: ${header.senderPostalCode}`);
 
     try {
-      // Vector-based search
+      const physicalTable = 'JUNO_INVOICE_ASSISTANT_V1_SUPPLIERVECTOR';
+      
+      // Step 1: Vector search on name (get top 10 candidates)
       const rows = await tx.run(`
         SELECT
-          "supplierNumber",
-          "supplierName",
-          "altNames",
-          "city",
+          "SUPPLIERNUMBER" as "supplierNumber",
+          "SUPPLIERNAME" as "supplierName",
+          "ALTNAMES" as "altNames",
+          "STREET" as "street",
+          "CITY" as "city",
+          "STATE" as "state",
+          "POSTALCODE" as "postalCode",
+          "COUNTRY" as "country",
           COSINE_SIMILARITY(
-            VECTOR_EMBEDDING(?, 'QUERY', ?),
-            "embedding"
-          ) AS "score"
-        FROM "${SupplierVector.name}"
-        WHERE "embedding" IS NOT NULL
-          AND "isActive" = TRUE
-        ORDER BY "score" DESC
-        LIMIT 5
+            VECTOR_EMBEDDING(?, 'DOCUMENT', ?),
+            "EMBEDDING"
+          ) AS "nameScore"
+        FROM "${physicalTable}"
+        WHERE "EMBEDDING" IS NOT NULL
+          AND "ISACTIVE" = TRUE
+        ORDER BY "nameScore" DESC
+        LIMIT 10
       `, [supplierName.trim(), MODEL]);
 
       if (!rows || rows.length === 0) {
@@ -100,20 +110,75 @@ module.exports = function(srv) {
         };
       }
 
-      const bestMatch = rows[0];
-      const matchScore = bestMatch.score;
+      // Step 2: Apply geographic boost to top candidates
+      const scoredResults = rows.map(row => {
+        let finalScore = row.nameScore;
+        let boostFactors = [];
 
-      // Determine confidence
+        // Boost if city matches (case-insensitive)
+        if (header.senderCity && row.city) {
+          const invoiceCity = header.senderCity.trim().toUpperCase();
+          const supplierCity = row.city.trim().toUpperCase();
+          
+          if (invoiceCity === supplierCity) {
+            finalScore += 0.05;
+            boostFactors.push('CITY');
+            LOG.info(`  ✓ City match: ${row.city}`);
+          }
+        }
+
+        // Boost if state matches
+        if (header.senderState && row.state) {
+          const invoiceState = header.senderState.trim().toUpperCase();
+          const supplierState = row.state.trim().toUpperCase();
+          
+          if (invoiceState === supplierState) {
+            finalScore += 0.03;
+            boostFactors.push('STATE');
+            LOG.info(`  ✓ State match: ${row.state}`);
+          }
+        }
+
+        // Boost if postal code matches (first 5 digits)
+        if (header.senderPostalCode && row.postalCode) {
+          const invoiceZip = header.senderPostalCode.replace(/[^0-9]/g, '').substring(0, 5);
+          const supplierZip = row.postalCode.replace(/[^0-9]/g, '').substring(0, 5);
+          
+          if (invoiceZip && supplierZip && invoiceZip === supplierZip) {
+            finalScore += 0.02;
+            boostFactors.push('ZIP');
+            LOG.info(`  ✓ ZIP match: ${supplierZip}`);
+          }
+        }
+
+        // Cap at 1.0
+        finalScore = Math.min(finalScore, 1.0);
+
+        return {
+          ...row,
+          originalScore: row.nameScore,
+          finalScore,
+          boostFactors: boostFactors.length > 0 ? boostFactors.join('+') : 'NONE'
+        };
+      });
+
+      // Step 3: Sort by final score
+      scoredResults.sort((a, b) => b.finalScore - a.finalScore);
+
+      const bestMatch = scoredResults[0];
+      const matchScore = bestMatch.finalScore;
+
+      // Step 4: Determine confidence based on final score
       let confidence = 'LOW';
       let matchStatus = 'MANUAL_REVIEW';
 
-      if (matchScore >= 0.9) {
+      if (matchScore >= 0.95) {
         confidence = 'HIGH';
         matchStatus = 'MATCHED';
-      } else if (matchScore >= 0.75) {
+      } else if (matchScore >= 0.85) {
         confidence = 'MEDIUM';
         matchStatus = 'MATCHED';
-      } else if (matchScore >= 0.6) {
+      } else if (matchScore >= 0.70) {
         confidence = 'LOW';
         matchStatus = 'MANUAL_REVIEW';
       } else {
@@ -121,9 +186,13 @@ module.exports = function(srv) {
         matchStatus = 'NO_MATCH';
       }
 
-      LOG.info(`Supplier matched: ${bestMatch.supplierName} (score: ${matchScore.toFixed(4)}, confidence: ${confidence})`);
+      LOG.info(`✓ Best match: ${bestMatch.supplierName} (${bestMatch.supplierNumber})`);
+      LOG.info(`  - Name score: ${bestMatch.originalScore.toFixed(4)}`);
+      LOG.info(`  - Geographic boosts: ${bestMatch.boostFactors}`);
+      LOG.info(`  - Final score: ${matchScore.toFixed(4)}`);
+      LOG.info(`  - Confidence: ${confidence}`);
 
-      // Update header
+      // Step 5: Update invoice header
       await tx.update(InvoiceHeader, headerId).set({
         matchedSupplierNumber: bestMatch.supplierNumber,
         matchedSupplierName: bestMatch.supplierName,
@@ -135,19 +204,24 @@ module.exports = function(srv) {
         message: `Supplier matched: ${bestMatch.supplierName} (${confidence} confidence, score: ${(matchScore * 100).toFixed(1)}%)`
       });
 
-      // Update supplier statistics
+      // Update supplier last used timestamp
       await tx.update(SupplierVector, bestMatch.supplierNumber).set({
         lastChangedAt: new Date()
       });
 
-      await logProcess(tx, headerId, 'MATCH_SUPPLIER', matchStatus, 
+      // Log detailed results
+      await logProcess(tx, headerId, 'MATCH_SUPPLIER', matchStatus,
         matchStatus === 'MATCHED' ? 'SUCCESS' : 'PARTIAL',
-        `Matched to ${bestMatch.supplierName} (score: ${matchScore.toFixed(4)})`,
-        { 
-          topMatches: rows.slice(0, 3).map(r => ({
+        `Matched to ${bestMatch.supplierName} (name: ${bestMatch.originalScore.toFixed(4)}, boosts: ${bestMatch.boostFactors}, final: ${matchScore.toFixed(4)})`,
+        {
+          topMatches: scoredResults.slice(0, 3).map(r => ({
             supplier: r.supplierNumber,
             name: r.supplierName,
-            score: r.score
+            city: r.city,
+            state: r.state,
+            nameScore: r.originalScore,
+            finalScore: r.finalScore,
+            boosts: r.boostFactors
           }))
         }
       );
@@ -179,7 +253,7 @@ module.exports = function(srv) {
   });
 
   // ============================================
-  // SYNC SUPPLIERS
+  // SYNC SUPPLIERS FROM SAP
   // ============================================
   srv.on('SyncSuppliers', async (req) => {
     const { mode = 'delta', since } = req.data;
@@ -204,14 +278,16 @@ module.exports = function(srv) {
         const chunk = suppliers.slice(i, i + CHUNK_SIZE);
         await tx.run(UPSERT.into(SupplierVector).entries(chunk));
         totalSynced += chunk.length;
+        
+        LOG.info(`Synced ${totalSynced}/${suppliers.length} suppliers`);
       }
 
       // Refresh embeddings
       let embeddingsRefreshed = false;
       try {
-        await srv.send({ event: 'RefreshSupplierEmbeddings' });
-        embeddingsRefreshed = true;
-        LOG.info('Supplier embeddings refreshed');
+        const result = await srv.send({ event: 'RefreshSupplierEmbeddings' });
+        embeddingsRefreshed = result && result.value === 1;
+        LOG.info(`Supplier embeddings refreshed: ${embeddingsRefreshed}`);
       } catch (e) {
         LOG.warn(`Embeddings not refreshed: ${e.message}`);
       }
@@ -236,48 +312,64 @@ module.exports = function(srv) {
   // REFRESH EMBEDDINGS
   // ============================================
   srv.on('RefreshSupplierEmbeddings', async (req) => {
-    const tx = cds.tx(req);
-
-    const physicalTable = getPhysicalTableName(SupplierVector);
-    const docExpr = `COALESCE("SUPPLIERNAME",'') || ' ' || COALESCE("ALTNAMES",'') || ' ' || COALESCE("CITY",'')`;
+    const db = cds.db;
+    const physicalTable = 'JUNO_INVOICE_ASSISTANT_V1_SUPPLIERVECTOR';
 
     try {
-      await tx.run(`
+      // Generate embeddings from name + alternative names only
+      // Using DOCUMENT type for symmetric name-to-name matching
+      await db.run(`
         UPDATE "${physicalTable}"
-        SET "EMBEDDING" = VECTOR_EMBEDDING(${docExpr}, 'DOCUMENT', ?),
-            "LASTREFRESHED" = CURRENT_UTCTIMESTAMP
+        SET "EMBEDDING" = VECTOR_EMBEDDING(
+          COALESCE("SUPPLIERNAME",'') || ' ' || COALESCE("ALTNAMES",''),
+          'DOCUMENT',
+          ?
+        ),
+        "LASTREFRESHED" = CURRENT_UTCTIMESTAMP
         WHERE "EMBEDDING" IS NULL
            OR "LASTREFRESHED" IS NULL
            OR DAYS_BETWEEN("LASTREFRESHED", CURRENT_UTCTIMESTAMP) > 7
       `, [MODEL]);
 
       LOG.info('Supplier embeddings refreshed successfully');
-      return 1;
+      return { value: 1, message: 'Embeddings refreshed successfully' };
 
     } catch (error) {
       LOG.warn(`Embeddings service unavailable: ${error.message}`);
       
-      // Fallback: update timestamp only
-      await tx.run(`
-        UPDATE "${physicalTable}"
-        SET "LASTREFRESHED" = CURRENT_UTCTIMESTAMP
-        WHERE "LASTREFRESHED" IS NULL
-           OR DAYS_BETWEEN("LASTREFRESHED", CURRENT_UTCTIMESTAMP) > 7
-      `);
+      // Fallback: just update timestamp
+      try {
+        await db.run(`
+          UPDATE "${physicalTable}"
+          SET "LASTREFRESHED" = CURRENT_UTCTIMESTAMP
+          WHERE "LASTREFRESHED" IS NULL
+             OR DAYS_BETWEEN("LASTREFRESHED", CURRENT_UTCTIMESTAMP) > 7
+        `);
+      } catch (e) {
+        // Ignore
+      }
 
-      return 0;
+      return { value: 0, message: `Embeddings unavailable: ${error.message}` };
     }
   });
 
-    // ============================================
-  // HELPER: FETCH SUPPLIERS FROM SAP
+  // ============================================
+  // FETCH SUPPLIERS FROM SAP - WITH ADDRESSES
   // ============================================
   async function fetchSuppliersFromSAP(destName, client, mode, since) {
     const PATH = '/API_BUSINESS_PARTNER/A_BusinessPartner';
     const SELECT = [
-      'BusinessPartner', 'BusinessPartnerFullName', 'BusinessPartnerName',
-      'SearchTerm1', 'SearchTerm2', 'Supplier', 'LastChangeDate',
-      'CreationDate', 'BusinessPartnerIsBlocked'
+      'BusinessPartner',
+      'BusinessPartnerFullName',
+      'BusinessPartnerName',
+      'SearchTerm1',
+      'SearchTerm2',
+      'Supplier',
+      'LastChangeDate',
+      'CreationDate',
+      'BusinessPartnerIsBlocked',
+      'OrganizationBPName1',
+      'OrganizationBPName2'
     ].join(',');
 
     let filter = `Supplier ne ''`;
@@ -287,9 +379,13 @@ module.exports = function(srv) {
       filter += ` and LastChangeDate ge datetime'${sinceDate}T00:00:00'`;
     }
 
+    // Expand to get address information
+    const expand = 'to_BusinessPartnerAddress';
+
     const url = buildUrl(PATH, {
       $select: SELECT,
       $filter: filter,
+      $expand: expand,
       $top: 5000,
       'sap-client': client,
       $format: 'json'
@@ -314,10 +410,36 @@ module.exports = function(srv) {
                        parseODataV2Date(row.CreationDate) ||
                        new Date();
 
+    // Get primary address from expanded navigation
+    const addresses = row.to_BusinessPartnerAddress?.results || 
+                     row.to_BusinessPartnerAddress || 
+                     [];
+    
+    // Find primary address (AddressID = '1') or use first available
+    const primaryAddress = Array.isArray(addresses) 
+      ? (addresses.find(a => a.AddressID === '1') || addresses[0] || {})
+      : addresses;
+
+    // Build alternative names from all available sources
+    const altNames = [
+      row.SearchTerm1,
+      row.SearchTerm2,
+      row.OrganizationBPName1,
+      row.OrganizationBPName2
+    ].filter(Boolean).join(' ').trim();
+
     return {
       supplierNumber: row.Supplier,
       supplierName: row.BusinessPartnerFullName || row.BusinessPartnerName || '',
-      altNames: [row.SearchTerm1, row.SearchTerm2].filter(Boolean).join(' ').trim(),
+      altNames: altNames || '',
+      
+      // Address fields
+      street: primaryAddress.StreetName || '',
+      city: primaryAddress.CityName || '',
+      postalCode: primaryAddress.PostalCode || '',
+      state: primaryAddress.Region || '',
+      country: primaryAddress.Country || '',
+      
       isActive: true,
       lastChangedAt: lastChanged
     };
@@ -331,24 +453,5 @@ module.exports = function(srv) {
       }
     });
     return url.pathname + url.search;
-  }
-
-  function getPhysicalTableName(entity) {
-    const m = cds.model?.definitions || {};
-    const entityName = entity.name;
-    let def = m[entityName];
-
-    if (!def && m[entityName]) {
-      const proj = m[entityName];
-      if (proj?.source && m[proj.source]) {
-        def = m[proj.source];
-      }
-    }
-
-    if (def && def['@cds.persistence.name']) {
-      return def['@cds.persistence.name'];
-    }
-
-    return entityName.replace(/\./g, '_').toUpperCase();
   }
 };
