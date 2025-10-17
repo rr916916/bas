@@ -114,7 +114,7 @@ module.exports = function(srv) {
     if (!supplierNumber) {
       return {
         valid: false,
-        exists: false,
+        supplierExists: false,
         supplierNumber: null,
         supplierName: null,
         isActive: false,

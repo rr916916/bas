@@ -372,7 +372,7 @@ service InvoiceServiceV1 {
    */
   type SupplierValidation {
     valid: Boolean;
-    exists: Boolean;
+    supplierExists: Boolean;
     supplierNumber: String(10);
     supplierName: String(120);
     isActive: Boolean;
