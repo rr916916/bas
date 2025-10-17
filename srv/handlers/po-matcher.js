@@ -1,7 +1,7 @@
 // srv/handlers/po-matcher.js
 const cds = require('@sap/cds');
 const { executeHttpRequest } = require('@sap-cloud-sdk/http-client');
-const { parseJSON, logProcess, toNumber, toBoolean } = require('../utils/helpers');
+const { parseJSON, logProcess, toNumber, toBoolean, parseODataV2Date } = require('../utils/helpers');
 
 const MODEL = process.env.EMBEDDINGS_MODEL || 'SAP_GXY.20250407';
 
@@ -440,8 +440,24 @@ module.exports = function(srv) {
         const poItem = await tx.read(SAPPOItem).where(key);
 
         if (poItem && poItem.length > 0) {
+          // Parse date - handle both OData V2 format and ISO strings
+          let deliveryDate = scheduleLine.ScheduleLineDeliveryDate;
+          
+          // If it's in OData V2 format like /Date(1234567890000)/
+          if (typeof deliveryDate === 'string' && deliveryDate.startsWith('/Date(')) {
+            deliveryDate = parseODataV2Date(deliveryDate);
+          }
+          // If it's already a Date object
+          else if (deliveryDate instanceof Date) {
+            // Keep as is
+          }
+          // If it's an ISO string, convert to Date
+          else if (typeof deliveryDate === 'string') {
+            deliveryDate = new Date(deliveryDate);
+          }
+          
           await tx.update(SAPPOItem).set({
-            DeliveryDate: scheduleLine.ScheduleLineDeliveryDate
+            DeliveryDate: deliveryDate
           }).where({ ID: poItem[0].ID });
         }
       }
