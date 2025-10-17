@@ -12,9 +12,15 @@ module.exports = function(srv) {
   // ============================================
   srv.on('InitializeBPAWorkflow', async (req) => {
     // BPA sends as flat key-value pairs in req.data
-    const headerId = req.data.headerId;
+    // Trim any whitespace from keys
+    const headerId = req.data.headerId || req.data['headerId ']?.trim();
+    
+    LOG.info('=== InitializeBPAWorkflow called ===');
+    LOG.info('Raw req.data:', JSON.stringify(req.data));
+    LOG.info('Extracted headerId:', headerId);
     
     if (!headerId) {
+      LOG.error('headerId is missing or empty');
       req.error(400, 'headerId is required');
       return;
     }
@@ -22,6 +28,8 @@ module.exports = function(srv) {
     const tx = cds.tx(req);
 
     try {
+      LOG.info(`Fetching invoice header for ID: ${headerId}`);
+      
       // Get header with DOX items count
       const header = await tx.read(InvoiceHeader, headerId, h => {
         h('*'),
@@ -29,9 +37,17 @@ module.exports = function(srv) {
       });
 
       if (!header) {
+        LOG.error(`Invoice not found: ${headerId}`);
         req.error(404, `Invoice ${headerId} not found`);
         return;
       }
+
+      LOG.info('Invoice found:', {
+        ID: header.ID,
+        fileName: header.fileName,
+        documentNumber: header.documentNumber,
+        senderName: header.senderName
+      });
 
       // Update status to BPA_STARTED
       await tx.update(InvoiceHeader, headerId).set({
