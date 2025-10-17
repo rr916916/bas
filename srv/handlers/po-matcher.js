@@ -9,6 +9,8 @@ module.exports = function(srv) {
   const LOG = cds.log('po-matcher');
   const { InvoiceHeader, DOXInvoiceItem, SAPPOItem } = srv.entities;
 
+  LOG.info('Registering PO Matcher handlers...');
+
   // ============================================
   // MATCH PO ITEMS
   // ============================================
@@ -47,6 +49,7 @@ module.exports = function(srv) {
         totalDoxItems: 0,
         matchedItems: 0,
         unmatchedItems: 0,
+        consolidatedItems: 0,
         threeWayMatchRequired: false,
         threeWayMatchPassed: false,
         confidence: 'NONE',
@@ -63,15 +66,10 @@ module.exports = function(srv) {
       if (fetchFromSAP) {
         LOG.info(`Fetching PO ${finalPO} from SAP`);
         
-        try {
-          await srv.send({
-            event: 'SyncPOFromSAP',
-            data: { poNumber: finalPO, headerId }
-          });
-        } catch (sapError) {
-          LOG.warn(`SAP fetch failed, will try to match with existing data: ${sapError.message}`);
-          // Continue anyway - maybe we have cached PO data
-        }
+        await srv.send({
+          event: 'SyncPOFromSAP',
+          data: { poNumber: finalPO, headerId }
+        });
       }
 
       // Get DOX items
@@ -86,6 +84,7 @@ module.exports = function(srv) {
           totalDoxItems: 0,
           matchedItems: 0,
           unmatchedItems: 0,
+          consolidatedItems: 0,
           threeWayMatchRequired: false,
           threeWayMatchPassed: false,
           confidence: 'NONE',
@@ -115,26 +114,22 @@ module.exports = function(srv) {
           continue;
         }
 
-        // Vector search for best PO item match - use physical table name
-        const physicalTable = 'JUNO_INVOICE_ASSISTANT_V1_SAPPOITEM';
-        
+        // Vector search for best PO item match
         const poMatches = await tx.run(`
           SELECT
-            "ID", "PURCHASEORDER" as "PurchaseOrder", "PURCHASEORDERITEM" as "PurchaseOrderItem",
-            "MATERIAL" as "Material", "MATERIALNAME" as "MaterialName",
-            "ORDERQUANTITY" as "OrderQuantity", "OPENQUANTITY" as "OpenQuantity", 
-            "GRQUANTITYPOSTED" as "GrQuantityPosted",
-            "INVOICEISEXPECTED" as "InvoiceIsExpected", 
-            "GOODSRECEIPTISEXPECTED" as "GoodsReceiptIsExpected",
-            "INVOICEISGOODSRECEIPTBASED" as "InvoiceIsGoodsReceiptBased",
-            "NETPRICEAMOUNT" as "NetPriceAmount", "CURRENCY" as "Currency",
+            "ID", "PurchaseOrder", "PurchaseOrderItem",
+            "Material", "MaterialName",
+            "OrderQuantity", "OpenQuantity", "GrQuantityPosted",
+            "InvoiceIsExpected", "GoodsReceiptIsExpected",
+            "InvoiceIsGoodsReceiptBased",
+            "NetPriceAmount", "Currency",
             COSINE_SIMILARITY(
-              VECTOR_EMBEDDING(?, 'DOCUMENT', ?),
-              "EMBEDDING"
+              VECTOR_EMBEDDING(?, 'QUERY', ?),
+              "embedding"
             ) AS "matchScore"
-          FROM "${physicalTable}"
-          WHERE "PURCHASEORDER" = ?
-            AND "INVOICEHEADER_ID" = ?
+          FROM "${SAPPOItem.name}"
+          WHERE "PurchaseOrder" = ?
+            AND "invoiceHeader_ID" = ?
           ORDER BY "matchScore" DESC
           LIMIT 3
         `, [query, MODEL, finalPO, headerId]);
@@ -143,9 +138,8 @@ module.exports = function(srv) {
           const bestMatch = poMatches[0];
           const matchScore = bestMatch.matchScore;
 
-          // Accept any match score >= 0.3 (very permissive for cross-system matching)
-          // Business logic will decide if manual review needed
-          if (matchScore >= 0.3) {
+          // Check if match is confident enough
+          if (matchScore >= 0.7) {
             // Update DOX item with match
             await tx.update(DOXInvoiceItem, doxItem.ID).set({
               matchStatus: 'MATCHED',
@@ -182,15 +176,12 @@ module.exports = function(srv) {
 
             LOG.info(`DOX item ${doxItem.lineNumber} matched to PO item ${bestMatch.PurchaseOrderItem} (score: ${matchScore.toFixed(4)})`);
           } else {
-            // Still log the best match even if score is low
-            LOG.warn(`DOX item ${doxItem.lineNumber} best match score: ${matchScore.toFixed(4)} (below threshold 0.3)`);
-            LOG.warn(`  DOX: ${query}`);
-            LOG.warn(`  PO:  ${bestMatch.Material || 'no-material'} ${bestMatch.MaterialName}`);
-            
             await tx.update(DOXInvoiceItem, doxItem.ID).set({
               matchStatus: 'NO_MATCH',
               matchScore
             });
+
+            LOG.warn(`DOX item ${doxItem.lineNumber} match score too low: ${matchScore.toFixed(4)}`);
           }
         } else {
           await tx.update(DOXInvoiceItem, doxItem.ID).set({
@@ -201,8 +192,28 @@ module.exports = function(srv) {
         }
       }
 
+      // ============================================
+      // CONSOLIDATE DUPLICATE PO LINE ITEMS
+      // ============================================
+      LOG.info(`Starting consolidation of matched items...`);
+      const consolidationResult = await consolidateDuplicatePOItems(tx, headerId, DOXInvoiceItem);
+      
+      LOG.info(`Consolidation complete:`, {
+        originalItems: doxItems.length,
+        matchedItems: matchedCount,
+        consolidatedItems: consolidationResult.consolidatedCount,
+        deletedItems: consolidationResult.deletedCount
+      });
+
+      // Re-read DOX items after consolidation to get accurate count
+      const finalDoxItems = await tx.read(DOXInvoiceItem).where({
+        invoiceHeader_ID: headerId
+      });
+
+      const finalMatchedCount = finalDoxItems.filter(i => i.matchStatus === 'MATCHED').length;
+
       // Calculate confidence
-      const matchRate = matchedCount / doxItems.length;
+      const matchRate = finalMatchedCount / finalDoxItems.length;
       let confidence = 'LOW';
       if (matchRate >= 0.9) confidence = 'HIGH';
       else if (matchRate >= 0.7) confidence = 'MEDIUM';
@@ -212,8 +223,8 @@ module.exports = function(srv) {
                                   (grChecksPassed === grChecksRequired && grChecksRequired > 0);
 
       // Update header
-      const poMatchStatus = matchedCount === doxItems.length ? 'MATCHED' :
-                           matchedCount > 0 ? 'PARTIAL' : 'NO_MATCH';
+      const poMatchStatus = finalMatchedCount === finalDoxItems.length ? 'MATCHED' :
+                           finalMatchedCount > 0 ? 'PARTIAL' : 'NO_MATCH';
 
       await tx.update(InvoiceHeader, headerId).set({
         poMatchStatus,
@@ -224,32 +235,36 @@ module.exports = function(srv) {
           : 'NOT_REQUIRED',
         grCheckPassed: threeWayMatchPassed,
         step: 'PO_MATCHED',
-        message: `Matched ${matchedCount} of ${doxItems.length} items. 3-way match: ${threeWayMatchPassed ? 'PASSED' : threeWayMatchRequired ? 'FAILED' : 'N/A'}`
+        message: `Matched and consolidated ${finalMatchedCount} of ${finalDoxItems.length} items. 3-way match: ${threeWayMatchPassed ? 'PASSED' : threeWayMatchRequired ? 'FAILED' : 'N/A'}`
       });
 
       await logProcess(tx, headerId, 'MATCH_PO', poMatchStatus, 
-        matchedCount > 0 ? 'SUCCESS' : 'FAILURE',
-        `Matched ${matchedCount}/${doxItems.length} items. 3-way: ${threeWayMatchPassed}`,
+        finalMatchedCount > 0 ? 'SUCCESS' : 'FAILURE',
+        `Matched ${matchedCount}/${doxItems.length} items, consolidated to ${finalMatchedCount} items. 3-way: ${threeWayMatchPassed}`,
         { 
+          originalDoxItems: doxItems.length,
           matchedCount,
-          totalItems: doxItems.length,
+          consolidatedCount: consolidationResult.consolidatedCount,
+          finalDoxItems: finalDoxItems.length,
           threeWayMatchRequired,
           threeWayMatchPassed,
           topMatches: matches.slice(0, 5)
         }
       );
 
-      LOG.info(`PO matching completed for invoice ${headerId}: ${matchedCount}/${doxItems.length} matched, 3-way: ${threeWayMatchPassed}`);
+      LOG.info(`PO matching completed for invoice ${headerId}: ${matchedCount}/${doxItems.length} matched, consolidated to ${finalDoxItems.length} items, 3-way: ${threeWayMatchPassed}`);
 
       return {
         totalDoxItems: doxItems.length,
         matchedItems: matchedCount,
         unmatchedItems: doxItems.length - matchedCount,
+        consolidatedItems: consolidationResult.consolidatedCount,
+        finalItemCount: finalDoxItems.length,
         threeWayMatchRequired,
         threeWayMatchPassed,
         confidence,
         status: poMatchStatus,
-        message: `${matchedCount} of ${doxItems.length} items matched with ${confidence} confidence`,
+        message: `${matchedCount} of ${doxItems.length} items matched, consolidated to ${finalDoxItems.length} items with ${confidence} confidence`,
         matches
       };
 
@@ -271,6 +286,96 @@ module.exports = function(srv) {
   });
 
   // ============================================
+  // CONSOLIDATE DUPLICATE PO ITEMS
+  // ============================================
+  async function consolidateDuplicatePOItems(tx, headerId, DOXInvoiceItemEntity) {
+    LOG.info(`Consolidating duplicate PO line items for invoice ${headerId}`);
+
+    // Get all matched DOX items
+    const matchedItems = await tx.read(DOXInvoiceItemEntity).where({
+      invoiceHeader_ID: headerId,
+      matchStatus: 'MATCHED'
+    }).and('matchedPOItem_ID is not null');
+
+    if (!matchedItems || matchedItems.length === 0) {
+      LOG.info('No matched items to consolidate');
+      return { consolidatedCount: 0, deletedCount: 0 };
+    }
+
+    // Group by matched PO item
+    const grouped = {};
+    
+    for (const item of matchedItems) {
+      const key = item.matchedPOItem_ID;
+      
+      if (!grouped[key]) {
+        grouped[key] = {
+          keepItem: item,
+          duplicates: []
+        };
+      } else {
+        grouped[key].duplicates.push(item);
+      }
+    }
+
+    // Process each group
+    let consolidatedCount = 0;
+    let deletedCount = 0;
+
+    for (const [poItemId, group] of Object.entries(grouped)) {
+      if (group.duplicates.length === 0) {
+        // No duplicates, skip
+        continue;
+      }
+
+      // Calculate consolidated totals
+      let totalQuantity = toNumber(group.keepItem.quantity, 3) || 0;
+      let totalNetAmount = toNumber(group.keepItem.netAmount, 2) || 0;
+      let totalTaxAmount = toNumber(group.keepItem.taxAmount, 2) || 0;
+
+      const duplicateIds = [];
+
+      for (const dup of group.duplicates) {
+        totalQuantity += toNumber(dup.quantity, 3) || 0;
+        totalNetAmount += toNumber(dup.netAmount, 2) || 0;
+        totalTaxAmount += toNumber(dup.taxAmount, 2) || 0;
+        duplicateIds.push(dup.ID);
+      }
+
+      LOG.info(`Consolidating ${group.duplicates.length + 1} items for PO item ${poItemId}:`, {
+        originalQty: group.keepItem.quantity,
+        originalAmount: group.keepItem.netAmount,
+        consolidatedQty: totalQuantity,
+        consolidatedAmount: totalNetAmount,
+        duplicatesRemoved: group.duplicates.length
+      });
+
+      // Update the kept item with consolidated totals
+      await tx.update(DOXInvoiceItemEntity, group.keepItem.ID).set({
+        quantity: totalQuantity,
+        netAmount: totalNetAmount,
+        taxAmount: totalTaxAmount,
+        description: group.keepItem.description + ' (Consolidated)'
+      });
+
+      // Delete duplicate items
+      for (const dupId of duplicateIds) {
+        await tx.delete(DOXInvoiceItemEntity, dupId);
+        deletedCount++;
+      }
+
+      consolidatedCount++;
+    }
+
+    LOG.info(`Consolidation summary: ${consolidatedCount} groups consolidated, ${deletedCount} duplicate items removed`);
+
+    return {
+      consolidatedCount,
+      deletedCount
+    };
+  }
+
+  // ============================================
   // SYNC PO FROM SAP
   // ============================================
   srv.on('SyncPOFromSAP', async (req) => {
@@ -287,7 +392,7 @@ module.exports = function(srv) {
 
     const DEST_NAME = process.env.S4_DEST_NAME || 'S4HANA';
     const SAP_CLIENT = process.env.S4_CLIENT || '100';
-    const SYSTEM_KIND = process.env.S4_KIND || 'onprem';
+    const SYSTEM_KIND = process.env.S4_KIND || 'cloud';
 
     try {
       // Fetch PO items
@@ -358,7 +463,7 @@ module.exports = function(srv) {
       return;
     }
 
-    const { headerId, items = [], systemKind = 'onprem' } = payload;
+    const { headerId, items = [], systemKind = 'cloud' } = payload;
 
     if (!headerId || !items.length) {
       req.error(400, 'headerId and items are required');
@@ -458,24 +563,24 @@ module.exports = function(srv) {
   srv.on('RefreshPOEmbeddings', async (req) => {
     const { headerId } = req.data;
     const db = cds.db;
-    const physicalTable = 'JUNO_INVOICE_ASSISTANT_V1_SAPPOITEM';
+    const table = SAPPOItem.name;
 
     try {
       if (headerId) {
         await db.run(`
-          UPDATE "${physicalTable}"
-          SET "EMBEDDING" = VECTOR_EMBEDDING(
-            COALESCE("MATERIAL",'') || ' ' || COALESCE("MATERIALNAME",''),
+          UPDATE "${table}"
+          SET "embedding" = VECTOR_EMBEDDING(
+            COALESCE("Material",'') || ' ' || COALESCE("MaterialName",''),
             'DOCUMENT',
             ?
           )
-          WHERE "INVOICEHEADER_ID" = ?
+          WHERE "invoiceHeader_ID" = ?
         `, [MODEL, headerId]);
       } else {
         await db.run(`
-          UPDATE "${physicalTable}"
-          SET "EMBEDDING" = VECTOR_EMBEDDING(
-            COALESCE("MATERIAL",'') || ' ' || COALESCE("MATERIALNAME",''),
+          UPDATE "${table}"
+          SET "embedding" = VECTOR_EMBEDDING(
+            COALESCE("Material",'') || ' ' || COALESCE("MaterialName",''),
             'DOCUMENT',
             ?
           )
@@ -495,44 +600,76 @@ module.exports = function(srv) {
   // ============================================
 
   async function fetchPOItemsFromSAP(destName, client, poNumber, systemKind) {
-    // Ensure PO number is padded to 10 digits for SAP
-    const paddedPO = poNumber.padStart(10, '0');
-    
-    // Use relative path from destination base (which already has /sap/opu/odata/sap)
-    const path = '/API_PURCHASEORDER_PROCESS_SRV/A_PurchaseOrderItem';
-    const filter = `PurchaseOrder eq '${paddedPO}'`;
-    
-    // Only select fields that exist in on-prem system
-    const select = [
-      'PurchaseOrder', 'PurchaseOrderItem', 'Material', 'PurchaseOrderItemText',
-      'OrderQuantity', 'PurchaseOrderQuantityUnit', 'NetPriceAmount',
-      'NetPriceQuantity', 'OrderPriceUnit', 'TaxCode', 'DocumentCurrency',
-      'Plant', 'StorageLocation',
-      'GoodsReceiptIsExpected', 'InvoiceIsExpected', 'InvoiceIsGoodsReceiptBased',
-      'AccountAssignmentCategory', 'PurchaseOrderItemCategory'
-    ].join(',');
+    if (systemKind === 'cloud') {
+      const path = '/API_PURCHASEORDER_PROCESS_SRV/A_PurchaseOrderItem';
+      const filter = `PurchaseOrder eq '${poNumber}'`;
+      const select = [
+        'PurchaseOrder', 'PurchaseOrderItem', 'Material', 'PurchaseOrderItemText',
+        'OrderQuantity', 'PurchaseOrderQuantityUnit', 'NetPriceAmount',
+        'NetPriceQuantity', 'OrderPriceUnit', 'TaxCode', 'DocumentCurrency',
+        'Plant', 'StorageLocation', 'ScheduleLineDeliveryDate',
+        'GoodsReceiptIsExpected', 'InvoiceIsExpected', 'InvoiceIsGoodsReceiptBased',
+        'AccountAssignmentCategory', 'PurchaseOrderItemCategory'
+      ].join(',');
 
-    const url = buildUrl(path, {
-      $filter: filter,
-      $select: select,
-      'sap-client': client,
-      $format: 'json'
-    });
+      const url = buildUrl(path, {
+        $filter: filter,
+        $select: select,
+        'sap-client': client,
+        $format: 'json'
+      });
 
-    LOG.info(`Fetching PO items: PO ${paddedPO}, URL: ${url}`);
+      const { data } = await executeHttpRequest(
+        { destinationName: destName },
+        { method: 'GET', url, headers: { Accept: 'application/json' } }
+      );
 
-    const { data } = await executeHttpRequest(
-      { destinationName: destName },
-      { method: 'GET', url, headers: { Accept: 'application/json' } }
-    );
+      return data?.d?.results || data?.value || [];
+    } else {
+      // On-prem
+      const path = '/sap/opu/odata/sap/MM_PUR_PO_MAINT_V2/C_PurchaseOrderItemTP';
+      const filter = `PurchaseOrder eq '${poNumber}'`;
 
-    return data?.d?.results || data?.value || [];
+      const url = buildUrl(path, {
+        $filter: filter,
+        'sap-client': client,
+        $format: 'json'
+      });
+
+      const { data } = await executeHttpRequest(
+        { destinationName: destName },
+        { method: 'GET', url, headers: { Accept: 'application/json' } }
+      );
+
+      return data?.d?.results || [];
+    }
   }
 
   async function fetchGRDataFromSAP(destName, client, poNumber, systemKind) {
-    // On-premise systems typically don't have this API readily available
-    // We'll skip GR fetch for now and rely on what's in the PO
-    LOG.info('Skipping GR data fetch for on-premise system');
+    if (systemKind === 'cloud') {
+      const path = '/API_MATERIAL_DOCUMENT_SRV/A_MaterialDocumentItem';
+      const filter = `PurchaseOrder eq '${poNumber}'`;
+      const select = [
+        'MaterialDocumentYear', 'MaterialDocument', 'MaterialDocumentItem',
+        'PurchaseOrder', 'PurchaseOrderItem', 'QuantityInEntryUnit',
+        'EntryUnit', 'GoodsMovementType', 'PostingDate'
+      ].join(',');
+
+      const url = buildUrl(path, {
+        $filter: filter,
+        $select: select,
+        'sap-client': client,
+        $format: 'json'
+      });
+
+      const { data } = await executeHttpRequest(
+        { destinationName: destName },
+        { method: 'GET', url, headers: { Accept: 'application/json' } }
+      );
+
+      return data?.d?.results || data?.value || [];
+    }
+
     return [];
   }
 
@@ -562,7 +699,7 @@ module.exports = function(srv) {
       NetPriceQuantityUnit: raw.NetPriceQuantityUnit || raw.OrderPriceUnit,
       Currency: raw.Currency || raw.DocumentCurrency,
       TaxCode: raw.TaxCode,
-      DeliveryDate: null, // Delivery date field not available in on-prem
+      DeliveryDate: raw.DeliveryDate || raw.ScheduleLineDeliveryDate,
       GoodsReceiptIsExpected: toBoolean(raw.GoodsReceiptIsExpected),
       InvoiceIsExpected: toBoolean(raw.InvoiceIsExpected),
       InvoiceIsGoodsReceiptBased: toBoolean(raw.InvoiceIsGoodsReceiptBased),

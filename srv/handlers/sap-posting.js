@@ -353,20 +353,128 @@ module.exports = function(srv) {
       });
     }
 
+    // Convert dates to SAP OData v2 format: /Date(timestamp)/
+    const documentDate = formatDateForSAP(header.documentDate);
+    const postingDate = formatDateForSAP(new Date());
+    const dueDate = formatDateForSAP(header.documentDate);
+
+    // Map payment terms to SAP codes
+    const paymentTerms = mapPaymentTerms(header.paymentTerms);
+
     // ⚠️ KEY FIX: Do NOT send InvoiceDocument and FiscalYear for CREATE
     // SAP generates these values and returns them in the response
     return {
       CompanyCode: header.companyCode,
-      DocumentDate: header.documentDate,
-      PostingDate: new Date().toISOString().split('T')[0],
+      DocumentDate: documentDate,
+      PostingDate: postingDate,
       InvoicingParty: header.matchedSupplierNumber,
       DocumentCurrency: header.currencyCode,
       InvoiceGrossAmount: String(header.grossAmount),
-      DueCalculationBaseDate: header.documentDate,
-      PaymentTerms: header.paymentTerms || '',
+      DueCalculationBaseDate: dueDate,
+      PaymentTerms: paymentTerms,
       DocumentHeaderText: `Invoice ${header.documentNumber || 'AUTO'}`,
       to_SuplrInvcItemPurOrdRef: items
     };
+  }
+
+  // ============================================
+  // FORMAT DATE FOR SAP ODATA V2
+  // ============================================
+  function formatDateForSAP(dateValue) {
+    if (!dateValue) return null;
+    
+    let date;
+    if (typeof dateValue === 'string') {
+      date = new Date(dateValue);
+    } else if (dateValue instanceof Date) {
+      date = dateValue;
+    } else {
+      return null;
+    }
+
+    // SAP OData v2 expects: /Date(timestamp)/
+    const timestamp = date.getTime();
+    return `/Date(${timestamp})/`;
+  }
+
+  // ============================================
+  // MAP PAYMENT TERMS TO SAP CODES
+  // ============================================
+  function mapPaymentTerms(invoiceTerms) {
+    if (!invoiceTerms) return '';
+
+    // Normalize the input
+    const normalized = invoiceTerms.trim().toUpperCase();
+
+    // Payment terms mapping - expand this as needed
+    const mappings = {
+      // Net terms
+      'NET 10': '0010',
+      'NET 10 EOM': '0010',
+      'NET 15': '0015',
+      'NET 30': '0030',
+      'NET 30 EOM': '0030',
+      'NET 45': '0045',
+      'NET 60': '0060',
+      'NET 90': '0090',
+      
+      // Due on receipt
+      'DUE ON RECEIPT': '0001',
+      'IMMEDIATE': '0001',
+      'PAYABLE IMMEDIATELY': '0001',
+      
+      // Common SAP codes (pass through)
+      '0001': '0001',
+      '0010': '0010',
+      '0015': '0015',
+      '0030': '0030',
+      '0045': '0045',
+      '0060': '0060',
+      '0090': '0090',
+      
+      // 2% 10 Net 30 variants
+      '2/10 NET 30': 'ZB01',
+      '2% 10 NET 30': 'ZB01',
+      
+      // Default
+      'DEFAULT': '0030'
+    };
+
+    // Try exact match first
+    if (mappings[normalized]) {
+      LOG.info(`Mapped payment terms: "${invoiceTerms}" → "${mappings[normalized]}"`);
+      return mappings[normalized];
+    }
+
+    // Try partial matches
+    if (normalized.includes('NET 10') || normalized.includes('N10')) {
+      LOG.info(`Mapped payment terms (partial): "${invoiceTerms}" → "0010"`);
+      return '0010';
+    }
+    if (normalized.includes('NET 15') || normalized.includes('N15')) {
+      LOG.info(`Mapped payment terms (partial): "${invoiceTerms}" → "0015"`);
+      return '0015';
+    }
+    if (normalized.includes('NET 30') || normalized.includes('N30')) {
+      LOG.info(`Mapped payment terms (partial): "${invoiceTerms}" → "0030"`);
+      return '0030';
+    }
+    if (normalized.includes('NET 45') || normalized.includes('N45')) {
+      LOG.info(`Mapped payment terms (partial): "${invoiceTerms}" → "0045"`);
+      return '0045';
+    }
+    if (normalized.includes('NET 60') || normalized.includes('N60')) {
+      LOG.info(`Mapped payment terms (partial): "${invoiceTerms}" → "0060"`);
+      return '0060';
+    }
+    if (normalized.includes('NET 90') || normalized.includes('N90')) {
+      LOG.info(`Mapped payment terms (partial): "${invoiceTerms}" → "0090"`);
+      return '0090';
+    }
+
+    // No match found - return empty string (SAP will use supplier default)
+    LOG.warn(`Payment terms not mapped: "${invoiceTerms}" - using empty string`);
+    return '';
   }
 
   // ============================================

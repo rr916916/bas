@@ -1,26 +1,37 @@
 // srv/service.js
 const cds = require('@sap/cds');
 
-// Import all handlers
-const workflowHandler = require('./handlers/workflow');
-const invoiceHandler = require('./handlers/invoice');
-const supplierHandler = require('./handlers/supplier');
-const supplierUtilsHandler = require('./handlers/supplier-utils');
-const poMatcherHandler = require('./handlers/po-matcher');
-const sapPostingHandler = require('./handlers/sap-posting');
-
 module.exports = cds.service.impl(async function() {
   const LOG = cds.log('service');
 
   LOG.info('Registering Invoice Service handlers');
 
+  // Import all handlers
+  const workflowHandler = require('./handlers/workflow');
+  const invoiceHandler = require('./handlers/invoice');
+  const supplierHandler = require('./handlers/supplier');
+  const supplierUtilsHandler = require('./handlers/supplier-utils');
+  const poMatcherHandler = require('./handlers/po-matcher');
+  const sapPostingHandler = require('./handlers/sap-posting');
+
   // Register all handlers
-  workflowHandler(this);        // BPA workflow-specific actions
-  invoiceHandler(this);         // Basic invoice operations
-  supplierHandler(this);        // Supplier matching
-  supplierUtilsHandler(this);   // Supplier utilities
-  poMatcherHandler(this);       // PO matching
-  sapPostingHandler(this);      // SAP posting
+  LOG.info('Registering workflow handler...');
+  workflowHandler(this);
+  
+  LOG.info('Registering invoice handler...');
+  invoiceHandler(this);
+  
+  LOG.info('Registering supplier handler...');
+  supplierHandler(this);
+  
+  LOG.info('Registering supplier utils handler...');
+  supplierUtilsHandler(this);
+  
+  LOG.info('Registering PO matcher handler...');
+  poMatcherHandler(this);
+  
+  LOG.info('Registering SAP posting handler...');
+  sapPostingHandler(this);
 
   // ============================================
   // GLOBAL ERROR HANDLER
@@ -121,4 +132,5 @@ module.exports = cds.service.impl(async function() {
   });
 
   LOG.info('Invoice Service initialization complete');
+  LOG.info('Registered handlers: workflow, invoice, supplier, supplier-utils, po-matcher, sap-posting');
 });
