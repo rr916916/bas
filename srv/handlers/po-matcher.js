@@ -115,6 +115,9 @@ module.exports = function(srv) {
         }
 
         // Vector search for best PO item match
+        // Use the physical table name from the database
+        const tableName = 'JUNO_INVOICE_ASSISTANT_V1_SAPPOITEM';
+        
         const poMatches = await tx.run(`
           SELECT
             "ID", "PurchaseOrder", "PurchaseOrderItem",
@@ -127,7 +130,7 @@ module.exports = function(srv) {
               VECTOR_EMBEDDING(?, 'QUERY', ?),
               "embedding"
             ) AS "matchScore"
-          FROM "${SAPPOItem.name}"
+          FROM "${tableName}"
           WHERE "PurchaseOrder" = ?
             AND "invoiceHeader_ID" = ?
           ORDER BY "matchScore" DESC
@@ -587,7 +590,8 @@ module.exports = function(srv) {
   srv.on('RefreshPOEmbeddings', async (req) => {
     const { headerId } = req.data;
     const db = cds.db;
-    const table = SAPPOItem.name;
+    // Use physical table name for HANA
+    const table = 'JUNO_INVOICE_ASSISTANT_V1_SAPPOITEM';
 
     try {
       if (headerId) {
