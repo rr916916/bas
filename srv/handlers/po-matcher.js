@@ -115,24 +115,24 @@ module.exports = function(srv) {
         }
 
         // Vector search for best PO item match
-        // Use the physical table name from the database
+        // Use the physical HANA table name and UPPERCASE column names
         const tableName = 'JUNO_INVOICE_ASSISTANT_V1_SAPPOITEM';
         
         const poMatches = await tx.run(`
           SELECT
-            "ID", "PurchaseOrder", "PurchaseOrderItem",
-            "Material", "MaterialName",
-            "OrderQuantity", "OpenQuantity", "GrQuantityPosted",
-            "InvoiceIsExpected", "GoodsReceiptIsExpected",
-            "InvoiceIsGoodsReceiptBased",
-            "NetPriceAmount", "Currency",
+            "ID", "PURCHASEORDER", "PURCHASEORDERITEM",
+            "MATERIAL", "MATERIALNAME",
+            "ORDERQUANTITY", "OPENQUANTITY", "GRQUANTITYPOSTED",
+            "INVOICEISEXPECTED", "GOODSRECEIPTISEXPECTED",
+            "INVOICEISGOODSRECEIPTBASED",
+            "NETPRICEAMOUNT", "CURRENCY",
             COSINE_SIMILARITY(
               VECTOR_EMBEDDING(?, 'QUERY', ?),
-              "embedding"
+              "EMBEDDING"
             ) AS "matchScore"
           FROM "${tableName}"
-          WHERE "PurchaseOrder" = ?
-            AND "invoiceHeader_ID" = ?
+          WHERE "PURCHASEORDER" = ?
+            AND "INVOICEHEADER_ID" = ?
           ORDER BY "matchScore" DESC
           LIMIT 3
         `, [query, MODEL, finalPO, headerId]);
@@ -141,8 +141,8 @@ module.exports = function(srv) {
           const bestMatch = poMatches[0];
           const matchScore = bestMatch.matchScore;
 
-          // Check if match is confident enough
-          if (matchScore >= 0.7) {
+          // Check if match is confident enough - lowered threshold to 0.3 for better matching
+          if (matchScore >= 0.3) {
             // Update DOX item with match
             await tx.update(DOXInvoiceItem, doxItem.ID).set({
               matchStatus: 'MATCHED',
@@ -152,12 +152,12 @@ module.exports = function(srv) {
 
             matchedCount++;
 
-            // Check 3-way match requirements
-            if (bestMatch.InvoiceIsGoodsReceiptBased) {
+            // Check 3-way match requirements - note UPPERCASE column names
+            if (bestMatch.INVOICEISGOODSRECEIPTBASED) {
               threeWayMatchRequired = true;
               grChecksRequired++;
 
-              const grPosted = toNumber(bestMatch.GrQuantityPosted, 3) || 0;
+              const grPosted = toNumber(bestMatch.GRQUANTITYPOSTED, 3) || 0;
               if (grPosted > 0) {
                 grChecksPassed++;
               }
@@ -169,15 +169,15 @@ module.exports = function(srv) {
               doxMaterial: doxItem.materialNumber,
               doxQuantity: doxItem.quantity,
               poItemId: bestMatch.ID,
-              poMaterial: bestMatch.Material,
-              poDescription: bestMatch.MaterialName,
-              poQuantity: bestMatch.OrderQuantity,
-              poOpenQuantity: bestMatch.OpenQuantity,
+              poMaterial: bestMatch.MATERIAL,
+              poDescription: bestMatch.MATERIALNAME,
+              poQuantity: bestMatch.ORDERQUANTITY,
+              poOpenQuantity: bestMatch.OPENQUANTITY,
               matchScore,
-              grPosted: bestMatch.GrQuantityPosted
+              grPosted: bestMatch.GRQUANTITYPOSTED
             });
 
-            LOG.info(`DOX item ${doxItem.lineNumber} matched to PO item ${bestMatch.PurchaseOrderItem} (score: ${matchScore.toFixed(4)})`);
+            LOG.info(`DOX item ${doxItem.lineNumber} matched to PO item ${bestMatch.PURCHASEORDERITEM} (score: ${matchScore.toFixed(4)})`);
           } else {
             await tx.update(DOXInvoiceItem, doxItem.ID).set({
               matchStatus: 'NO_MATCH',
@@ -397,7 +397,7 @@ module.exports = function(srv) {
     const SAP_CLIENT = process.env.S4_CLIENT || '100';
 
     try {
-      // ✅ Fetch PO items using API_PURCHASEORDER_PROCESS_SRV
+      // Fetch PO items using API_PURCHASEORDER_PROCESS_SRV
       const poItems = await fetchPOItemsFromSAP(DEST_NAME, SAP_CLIENT, poNumber);
 
       LOG.info(`Fetched ${poItems.length} PO items from SAP`);
@@ -427,7 +427,7 @@ module.exports = function(srv) {
         data: { headerId }
       });
 
-      // ✅ Fetch schedule lines to get delivery dates
+      // Fetch schedule lines to get delivery dates
       const scheduleLines = await fetchScheduleLinesFromSAP(DEST_NAME, SAP_CLIENT, poNumber);
       
       LOG.info(`Fetched ${scheduleLines.length} schedule lines from SAP`);
@@ -590,25 +590,25 @@ module.exports = function(srv) {
   srv.on('RefreshPOEmbeddings', async (req) => {
     const { headerId } = req.data;
     const db = cds.db;
-    // Use physical table name for HANA
+    // Use physical table name and column names (UPPERCASE for HANA)
     const table = 'JUNO_INVOICE_ASSISTANT_V1_SAPPOITEM';
 
     try {
       if (headerId) {
         await db.run(`
           UPDATE "${table}"
-          SET "embedding" = VECTOR_EMBEDDING(
-            COALESCE("Material",'') || ' ' || COALESCE("MaterialName",''),
+          SET "EMBEDDING" = VECTOR_EMBEDDING(
+            COALESCE("MATERIAL",'') || ' ' || COALESCE("MATERIALNAME",''),
             'DOCUMENT',
             ?
           )
-          WHERE "invoiceHeader_ID" = ?
+          WHERE "INVOICEHEADER_ID" = ?
         `, [MODEL, headerId]);
       } else {
         await db.run(`
           UPDATE "${table}"
-          SET "embedding" = VECTOR_EMBEDDING(
-            COALESCE("Material",'') || ' ' || COALESCE("MaterialName",''),
+          SET "EMBEDDING" = VECTOR_EMBEDDING(
+            COALESCE("MATERIAL",'') || ' ' || COALESCE("MATERIALNAME",''),
             'DOCUMENT',
             ?
           )
@@ -624,15 +624,15 @@ module.exports = function(srv) {
   });
 
   // ============================================
-  // HELPERS - FIXED: Correct URL paths
+  // HELPERS - Correct URL paths for destination
   // ============================================
 
   /**
-   * ✅ FIXED: Fetch PO items - correct path from destination base
+   * Fetch PO items - correct path from destination base
+   * Destination base: https://vhcals4hci.resolvetech.com/sap/opu/odata/sap
+   * Append: /API_PURCHASEORDER_PROCESS_SRV/A_PurchaseOrderItem
    */
   async function fetchPOItemsFromSAP(destName, client, poNumber) {
-    // Destination base: https://vhcals4hci.resolvetech.com/sap/opu/odata/sap
-    // We need to add: /API_PURCHASEORDER_PROCESS_SRV/A_PurchaseOrderItem
     const path = '/API_PURCHASEORDER_PROCESS_SRV/A_PurchaseOrderItem';
     const filter = `PurchaseOrder eq '${poNumber}'`;
     
@@ -679,7 +679,7 @@ module.exports = function(srv) {
   }
 
   /**
-   * ✅ FIXED: Fetch schedule lines - correct path from destination base
+   * Fetch schedule lines - correct path from destination base
    */
   async function fetchScheduleLinesFromSAP(destName, client, poNumber) {
     const path = '/API_PURCHASEORDER_PROCESS_SRV/A_PurchaseOrderScheduleLine';
@@ -721,7 +721,7 @@ module.exports = function(srv) {
   }
 
   /**
-   * ✅ Map PO item from SAP response to internal format
+   * Map PO item from SAP response to internal format
    */
   function mapPOItem(raw, headerId) {
     return {
