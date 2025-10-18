@@ -276,7 +276,8 @@ module.exports = function(srv) {
         DocumentCurrency: header.currencyCode,
         SupplierInvoiceItemAmount: String(doxItem.netAmount),
         QuantityInPurchaseOrderUnit: String(doxItem.quantity),
-        PurchaseOrderQuantityUnit: doxItem.unitOfMeasure || poItem.OrderUnit || ''
+        // ✅ CRITICAL FIX: Always use PO's unit, never invoice's unit
+        PurchaseOrderQuantityUnit: poItem.OrderUnit || ''
       });
     }
 
@@ -284,9 +285,6 @@ module.exports = function(srv) {
     const documentDate = formatDateForSAPOData(header.documentDate);
     const postingDate = formatDateForSAPOData(new Date());
     const dueDate = formatDateForSAPOData(header.dueDate || header.documentDate);
-
-    // Map payment terms
-    const paymentTerms = mapPaymentTerms(header.paymentTerms);
 
     // Build payload according to API_SUPPLIERINVOICE_PROCESS_SRV metadata
     return {
@@ -297,70 +295,11 @@ module.exports = function(srv) {
       DocumentCurrency: header.currencyCode,
       InvoiceGrossAmount: String(header.grossAmount),
       DueCalculationBaseDate: dueDate,
-      PaymentTerms: paymentTerms,
+      // PaymentTerms removed - SAP will use supplier's default payment terms
       DocumentHeaderText: header.documentNumber ? `Invoice ${header.documentNumber}` : 'AUTO',
       SupplierInvoiceIDByInvcgParty: header.documentNumber || '',
       to_SuplrInvcItemPurOrdRef: items
     };
-  }
-
-  // ============================================
-  // MAP PAYMENT TERMS
-  // ============================================
-  function mapPaymentTerms(invoiceTerms) {
-    if (!invoiceTerms) return '';
-
-    const normalized = invoiceTerms.trim().toUpperCase();
-
-    const mappings = {
-      'NET 10': '0010',
-      'NET 10 EOM': '0010',
-      'NET 15': '0015',
-      'NET 30': '0030',
-      'NET 30 EOM': '0030',
-      'NET 45': '0045',
-      'NET 60': '0060',
-      'NET 90': '0090',
-      'DUE ON RECEIPT': '0001',
-      'IMMEDIATE': '0001',
-      'PAYABLE IMMEDIATELY': '0001',
-      '2/10 NET 30': 'ZB01',
-      '2% 10 NET 30': 'ZB01',
-      '0001': '0001',
-      '0010': '0010',
-      '0015': '0015',
-      '0030': '0030',
-      '0045': '0045',
-      '0060': '0060',
-      '0090': '0090'
-    };
-
-    // Exact match
-    if (mappings[normalized]) {
-      LOG.info(`Mapped payment terms: "${invoiceTerms}" → "${mappings[normalized]}"`);
-      return mappings[normalized];
-    }
-
-    // Partial matches
-    const partialMappings = [
-      { match: /NET\s*10|N10/, value: '0010' },
-      { match: /NET\s*15|N15/, value: '0015' },
-      { match: /NET\s*30|N30/, value: '0030' },
-      { match: /NET\s*45|N45/, value: '0045' },
-      { match: /NET\s*60|N60/, value: '0060' },
-      { match: /NET\s*90|N90/, value: '0090' }
-    ];
-
-    for (const pm of partialMappings) {
-      if (pm.match.test(normalized)) {
-        LOG.info(`Mapped payment terms (partial): "${invoiceTerms}" → "${pm.value}"`);
-        return pm.value;
-      }
-    }
-
-    // No match - return empty (SAP uses supplier default)
-    LOG.warn(`Payment terms not mapped: "${invoiceTerms}"`);
-    return '';
   }
 
   // ============================================
