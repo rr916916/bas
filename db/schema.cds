@@ -8,7 +8,7 @@ using {
 // ============================================
 // INVOICE HEADER
 // ============================================
-@assert.unique: {correlationId: [correlationId]}
+
 entity InvoiceHeader : cuid, managed {
   // --- Integration IDs ---
   correlationId          : String(80)  @title: 'Correlation ID';

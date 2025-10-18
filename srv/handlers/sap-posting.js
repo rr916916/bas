@@ -1,11 +1,18 @@
 // srv/handlers/sap-posting.js
 const cds = require('@sap/cds');
 const { executeHttpRequest } = require('@sap-cloud-sdk/http-client');
-const { formatDateForSAP, logProcess, parseJSON } = require('../utils/helpers');
+const { 
+  parseJSON, 
+  logProcess, 
+  truncate, 
+  formatDateForSAPOData,
+  extractSAPError,
+  buildUrl
+} = require('../utils/helpers');
 
 module.exports = function(srv) {
   const LOG = cds.log('sap-posting');
-  const { InvoiceHeader, DOXInvoiceItem } = srv.entities;
+  const { InvoiceHeader, DOXInvoiceItem, SAPPOItem } = srv.entities;
 
   // ============================================
   // POST TO SAP
@@ -20,201 +27,395 @@ module.exports = function(srv) {
 
     const tx = cds.tx(req);
 
-    LOG.info(`Posting invoice ${headerId} to SAP (type: ${postingType})`);
+    // Get invoice with all related data
+    const header = await tx.read(InvoiceHeader, headerId, h => {
+      h('*'),
+      h.doxItems(di => di('*')),
+      h.poItems(pi => pi('*'))
+    });
+
+    if (!header) {
+      req.error(404, `Invoice ${headerId} not found`);
+      return;
+    }
+
+    LOG.info(`Posting invoice ${headerId} to SAP as ${postingType}`);
+
+    const DEST_NAME = process.env.S4_DEST_NAME || 'S4HANA';
+    const SYSTEM_KIND = process.env.S4_KIND || 'onprem';
 
     try {
-      // Get invoice header with items
-      const header = await tx.read(InvoiceHeader, headerId, h => {
-        h('*'),
-        h.doxItems('*')
+      let sapResponse;
+
+      if (postingType === 'SUPPLIER_INVOICE') {
+        sapResponse = await postSupplierInvoice(header, DEST_NAME, SYSTEM_KIND);
+      } else if (postingType === 'ACCOUNTING_DOC') {
+        sapResponse = await postAccountingDocument(header, DEST_NAME, SYSTEM_KIND);
+      } else {
+        req.error(400, `Invalid posting type: ${postingType}`);
+        return;
+      }
+
+      const success = sapResponse.type === 'S';
+
+      // Update header - truncate long values to fit schema
+      await tx.update(InvoiceHeader, headerId).set({
+        accountingDocument: sapResponse.document,
+        fiscalYear: sapResponse.fiscalYear,
+        accountingDocType: sapResponse.docType,
+        sapReturnType: sapResponse.type,
+        sapReturnMessage: truncate(sapResponse.message, 255),
+        sapMessageClass: truncate(sapResponse.messageClass, 50),
+        sapMessageNumber: truncate(sapResponse.messageNumber, 10),
+        step: success ? 'POSTED' : 'POST_FAILED',
+        status: success ? 'COMPLETED' : 'ERROR',
+        result: success ? 'SUCCESS' : 'FAILURE',
+        postingDate: success ? new Date().toISOString().split('T')[0] : null
       });
 
-      if (!header) {
-        req.error(404, `Invoice ${headerId} not found`);
-        return;
-      }
+      await logProcess(tx, headerId, 'SAP_POST', 
+        success ? 'POSTED' : 'FAILED',
+        success ? 'SUCCESS' : 'FAILURE',
+        sapResponse.message,
+        { sapResponse: sapResponse.fullResponse }
+      );
 
-      // Validate invoice is ready for posting
-      if (!header.matchedSupplierNumber) {
-        req.error(400, 'Invoice supplier not matched');
-        return;
-      }
+      LOG.info(`Invoice ${headerId} posting ${success ? 'succeeded' : 'failed'}: ${sapResponse.message}`);
 
-      if (!header.netAmount || header.netAmount <= 0) {
-        req.error(400, 'Invalid invoice amount');
-        return;
-      }
-
-      LOG.info(`Posting invoice: Supplier ${header.matchedSupplierNumber}, Amount ${header.netAmount} ${header.currencyCode}`);
-
-      // Build SAP invoice document
-      const sapInvoice = buildSAPInvoiceDocument(header);
-
-      // Post to SAP
-      const DEST_NAME = process.env.S4_DEST_NAME || 'S4HANA';
-      const sapResponse = await postInvoiceToSAP(DEST_NAME, sapInvoice);
-
-      // Process response
-      const isSuccess = sapResponse.returnType === 'S';
-
-      if (isSuccess) {
-        await tx.update(InvoiceHeader, headerId).set({
-          accountingDocument: sapResponse.accountingDocument,
-          fiscalYear: sapResponse.fiscalYear,
-          accountingDocType: sapResponse.docType,
-          sapReturnType: sapResponse.returnType,
-          sapReturnMessage: sapResponse.message,
-          sapMessageClass: sapResponse.messageClass,
-          sapMessageNumber: sapResponse.messageNumber,
-          status: 'COMPLETED',
-          step: 'POSTED',
-          result: 'SUCCESS',
-          message: `Posted successfully: ${sapResponse.accountingDocument}`
-        });
-
-        await logProcess(tx, headerId, 'SAP_POST', 'POSTED', 'SUCCESS',
-          `Document ${sapResponse.accountingDocument} posted successfully`);
-
-        LOG.info(`Invoice ${headerId} posted successfully: ${sapResponse.accountingDocument}`);
-
-        return {
-          success: true,
-          accountingDocument: sapResponse.accountingDocument,
-          fiscalYear: sapResponse.fiscalYear,
-          message: sapResponse.message,
-          sapResponse: JSON.stringify(sapResponse)
-        };
-
-      } else {
-        await tx.update(InvoiceHeader, headerId).set({
-          sapReturnType: sapResponse.returnType,
-          sapReturnMessage: sapResponse.message,
-          sapMessageClass: sapResponse.messageClass,
-          sapMessageNumber: sapResponse.messageNumber,
-          status: 'ERROR',
-          step: 'POST_FAILED',
-          result: 'FAILURE',
-          lastError: sapResponse.message,
-          lastErrorAt: new Date()
-        });
-
-        await logProcess(tx, headerId, 'SAP_POST', 'FAILED', 'FAILURE',
-          `Posting failed: ${sapResponse.message}`);
-
-        LOG.error(`Invoice ${headerId} posting failed: ${sapResponse.message}`);
-
-        req.error(500, `SAP posting failed: ${sapResponse.message}`);
-      }
+      return {
+        success,
+        accountingDocument: sapResponse.document,
+        fiscalYear: sapResponse.fiscalYear,
+        message: sapResponse.message,
+        sapResponse: JSON.stringify(sapResponse.fullResponse)
+      };
 
     } catch (error) {
-      LOG.error('Posting to SAP failed:', error);
+      LOG.error('SAP posting failed:', error);
 
       await tx.update(InvoiceHeader, headerId).set({
-        status: 'ERROR',
         step: 'POST_ERROR',
-        lastError: error.message,
-        lastErrorAt: new Date()
+        status: 'ERROR',
+        result: 'FAILURE',
+        lastError: truncate(error.message, 500),
+        lastErrorAt: new Date(),
+        retryCount: (header.retryCount || 0) + 1
       });
 
       await logProcess(tx, headerId, 'SAP_POST', 'ERROR', 'FAILURE',
-        `Posting error: ${error.message}`);
+        error.message);
 
-      req.error(500, `Failed to post invoice: ${error.message}`);
+      req.error(500, `SAP posting failed: ${error.message}`);
     }
   });
 
   // ============================================
-  // HELPERS
+  // RECORD POSTING RESULT
   // ============================================
+  srv.on('RecordPostingResult', async (req) => {
+    const { data } = req.data;
+    const payload = parseJSON(data);
 
-  function buildSAPInvoiceDocument(header) {
-    const documentDate = formatDateForSAP(header.documentDate);
-    const postingDate = formatDateForSAP(new Date());
+    if (!payload || !payload.headerId) {
+      req.error(400, 'Invalid data: headerId is required');
+      return;
+    }
+
+    const tx = cds.tx(req);
+    const isSuccess = payload.sapReturnType === 'S';
+
+    await tx.update(InvoiceHeader, payload.headerId).set({
+      accountingDocument: payload.accountingDocument,
+      fiscalYear: payload.fiscalYear,
+      accountingDocType: payload.accountingDocType,
+      sapReturnType: payload.sapReturnType,
+      sapReturnMessage: truncate(payload.sapReturnMessage, 255),
+      sapMessageClass: truncate(payload.sapMessageClass, 50),
+      sapMessageNumber: truncate(payload.sapMessageNumber, 10),
+      clearingDate: payload.clearingDate,
+      status: isSuccess ? 'COMPLETED' : 'ERROR',
+      step: isSuccess ? 'POSTED' : 'POST_FAILED',
+      result: isSuccess ? 'SUCCESS' : 'FAILURE'
+    });
+
+    await logProcess(tx, payload.headerId, 'SAP_POST',
+      isSuccess ? 'POSTED' : 'FAILED',
+      isSuccess ? 'SUCCESS' : 'FAILURE',
+      payload.sapReturnMessage
+    );
+
+    LOG.info(`Posting result recorded for invoice ${payload.headerId}: ${isSuccess ? 'SUCCESS' : 'FAILURE'}`);
 
     return {
-      CompanyCode: header.companyCode,
-      Supplier: header.matchedSupplierNumber,
-      DocumentDate: documentDate,
-      PostingDate: postingDate,
-      InvoiceReference: header.documentNumber,
-      DocumentCurrency: header.currencyCode,
-      InvoiceGrossAmount: header.grossAmount,
-      TaxAmount: header.taxAmount,
-      DocumentHeaderText: `Invoice ${header.documentNumber}`,
-      
-      // Line items
-      Items: (header.doxItems || []).map((item, index) => ({
-        ItemNumber: String((index + 1) * 10).padStart(6, '0'),
-        GLAccount: '0000400000', // Default G/L account
-        Amount: item.netAmount,
-        TaxCode: item.taxCode || 'V0',
-        Quantity: item.quantity,
-        UnitOfMeasure: item.unitOfMeasure,
-        ItemText: item.description,
-        MaterialNumber: item.materialNumber
-      }))
+      status: isSuccess ? 'SUCCESS' : 'FAILURE',
+      message: payload.sapReturnMessage
     };
-  }
+  });
 
-  async function postInvoiceToSAP(destName, invoiceData) {
-    // This uses the Supplier Invoice API
+  // ============================================
+  // POST SUPPLIER INVOICE
+  // ============================================
+  async function postSupplierInvoice(header, destName, systemKind) {
+    LOG.info(`Posting supplier invoice to SAP (${systemKind})`);
+
+    const payload = buildSupplierInvoicePayload(header);
+    LOG.info('Posting payload:', JSON.stringify(payload, null, 2));
+
     // Destination base: https://vhcals4hci.resolvetech.com/sap/opu/odata/sap
-    // Append: /API_SUPPLIERINVOICE_PROCESS_SRV/A_SupplierInvoice
-    
+    // Path: /API_SUPPLIERINVOICE_PROCESS_SRV/A_SupplierInvoice
     const path = '/API_SUPPLIERINVOICE_PROCESS_SRV/A_SupplierInvoice';
-    const SAP_CLIENT = process.env.S4_CLIENT || '100';
+    const client = process.env.S4_CLIENT || '100';
 
     try {
       const { data } = await executeHttpRequest(
         { destinationName: destName },
         {
           method: 'POST',
-          url: buildUrl(path, { 'sap-client': SAP_CLIENT, $format: 'json' }),
-          headers: { 
+          url: buildUrl(path, { 'sap-client': client, $format: 'json' }),
+          headers: {
             'Content-Type': 'application/json',
-            Accept: 'application/json'
+            'Accept': 'application/json'
           },
-          data: invoiceData
+          data: payload
         }
       );
 
-      // Parse SAP response
+      // Handle OData v2 response (wrapped in 'd')
+      const result = data?.d || data;
+      LOG.info('SAP Response:', JSON.stringify(result, null, 2));
+
       return {
-        returnType: 'S',
-        accountingDocument: data?.AccountingDocument || data?.d?.AccountingDocument,
-        fiscalYear: data?.FiscalYear || data?.d?.FiscalYear,
-        docType: data?.AccountingDocumentType || 'KR',
-        message: 'Invoice posted successfully',
-        messageClass: '', // Leave empty on success
-        messageNumber: ''
+        type: 'S',
+        document: result.SupplierInvoice,
+        fiscalYear: result.FiscalYear,
+        docType: 'RE',
+        message: `Supplier invoice ${result.SupplierInvoice} created successfully`,
+        messageClass: '',
+        messageNumber: '',
+        fullResponse: data
       };
 
     } catch (error) {
-      LOG.error('SAP API call failed:', error);
+      LOG.error('SAP API Error:', {
+        message: error.message,
+        response: error.response?.data,
+        status: error.response?.status
+      });
 
-      // Parse error response
-      const errorData = error.response?.data || error;
-      const sapError = errorData?.error?.innererror?.errordetails?.[0] || errorData?.error;
-
-      return {
-        returnType: 'E',
-        accountingDocument: null,
-        fiscalYear: null,
-        docType: null,
-        message: sapError?.message || error.message,
-        messageClass: sapError?.code || '',
-        messageNumber: ''
-      };
+      const sapError = extractSAPError(error);
+      throw new Error(`SAP posting failed: ${sapError}`);
     }
   }
 
-  function buildUrl(path, params) {
-    const url = new URL('http://dummy' + path);
-    Object.entries(params).forEach(([key, value]) => {
-      if (value !== undefined && value !== null) {
-        url.searchParams.set(key, value);
+  // ============================================
+  // POST ACCOUNTING DOCUMENT
+  // ============================================
+  async function postAccountingDocument(header, destName, systemKind) {
+    LOG.info(`Posting accounting document to SAP (${systemKind})`);
+
+    const payload = buildAccountingDocPayload(header);
+    const path = '/API_JOURNALENTRY_SRV/A_JournalEntryBulkCreateRequest';
+    const client = process.env.S4_CLIENT || '100';
+
+    try {
+      const { data } = await executeHttpRequest(
+        { destinationName: destName },
+        {
+          method: 'POST',
+          url: buildUrl(path, { 'sap-client': client, $format: 'json' }),
+          headers: {
+            'Content-Type': 'application/json',
+            'Accept': 'application/json'
+          },
+          data: payload
+        }
+      );
+
+      return {
+        type: 'S',
+        document: data.AccountingDocument || data.d?.AccountingDocument,
+        fiscalYear: data.FiscalYear || data.d?.FiscalYear,
+        docType: 'KR',
+        message: `Accounting document created successfully`,
+        messageClass: '',
+        messageNumber: '',
+        fullResponse: data
+      };
+
+    } catch (error) {
+      LOG.error('SAP API Error:', error);
+      const sapError = extractSAPError(error);
+      throw new Error(`Accounting document posting failed: ${sapError}`);
+    }
+  }
+
+  // ============================================
+  // BUILD SUPPLIER INVOICE PAYLOAD
+  // Verified against API_SUPPLIERINVOICE_PROCESS_SRV metadata
+  // ============================================
+  function buildSupplierInvoicePayload(header) {
+    const items = [];
+
+    // Build line items from matched DOX items
+    for (const doxItem of header.doxItems || []) {
+      if (doxItem.matchStatus !== 'MATCHED' || !doxItem.matchedPOItem_ID) {
+        continue;
       }
+
+      const poItem = (header.poItems || []).find(pi => pi.ID === doxItem.matchedPOItem_ID);
+      if (!poItem) continue;
+
+      items.push({
+        SupplierInvoiceItem: String(items.length + 1).padStart(4, '0'),
+        PurchaseOrder: poItem.PurchaseOrder,
+        PurchaseOrderItem: poItem.PurchaseOrderItem,
+        Plant: poItem.Plant || '',
+        TaxCode: doxItem.taxCode || poItem.TaxCode || '',
+        DocumentCurrency: header.currencyCode,
+        SupplierInvoiceItemAmount: String(doxItem.netAmount),
+        QuantityInPurchaseOrderUnit: String(doxItem.quantity),
+        PurchaseOrderQuantityUnit: doxItem.unitOfMeasure || poItem.OrderUnit || ''
+      });
+    }
+
+    // Format dates in OData v2 format: /Date(timestamp)/
+    const documentDate = formatDateForSAPOData(header.documentDate);
+    const postingDate = formatDateForSAPOData(new Date());
+    const dueDate = formatDateForSAPOData(header.dueDate || header.documentDate);
+
+    // Map payment terms
+    const paymentTerms = mapPaymentTerms(header.paymentTerms);
+
+    // Build payload according to API_SUPPLIERINVOICE_PROCESS_SRV metadata
+    return {
+      CompanyCode: header.companyCode,
+      DocumentDate: documentDate,
+      PostingDate: postingDate,
+      InvoicingParty: header.matchedSupplierNumber,
+      DocumentCurrency: header.currencyCode,
+      InvoiceGrossAmount: String(header.grossAmount),
+      DueCalculationBaseDate: dueDate,
+      PaymentTerms: paymentTerms,
+      DocumentHeaderText: header.documentNumber ? `Invoice ${header.documentNumber}` : 'AUTO',
+      SupplierInvoiceIDByInvcgParty: header.documentNumber || '',
+      to_SuplrInvcItemPurOrdRef: items
+    };
+  }
+
+  // ============================================
+  // MAP PAYMENT TERMS
+  // ============================================
+  function mapPaymentTerms(invoiceTerms) {
+    if (!invoiceTerms) return '';
+
+    const normalized = invoiceTerms.trim().toUpperCase();
+
+    const mappings = {
+      'NET 10': '0010',
+      'NET 10 EOM': '0010',
+      'NET 15': '0015',
+      'NET 30': '0030',
+      'NET 30 EOM': '0030',
+      'NET 45': '0045',
+      'NET 60': '0060',
+      'NET 90': '0090',
+      'DUE ON RECEIPT': '0001',
+      'IMMEDIATE': '0001',
+      'PAYABLE IMMEDIATELY': '0001',
+      '2/10 NET 30': 'ZB01',
+      '2% 10 NET 30': 'ZB01',
+      '0001': '0001',
+      '0010': '0010',
+      '0015': '0015',
+      '0030': '0030',
+      '0045': '0045',
+      '0060': '0060',
+      '0090': '0090'
+    };
+
+    // Exact match
+    if (mappings[normalized]) {
+      LOG.info(`Mapped payment terms: "${invoiceTerms}" → "${mappings[normalized]}"`);
+      return mappings[normalized];
+    }
+
+    // Partial matches
+    const partialMappings = [
+      { match: /NET\s*10|N10/, value: '0010' },
+      { match: /NET\s*15|N15/, value: '0015' },
+      { match: /NET\s*30|N30/, value: '0030' },
+      { match: /NET\s*45|N45/, value: '0045' },
+      { match: /NET\s*60|N60/, value: '0060' },
+      { match: /NET\s*90|N90/, value: '0090' }
+    ];
+
+    for (const pm of partialMappings) {
+      if (pm.match.test(normalized)) {
+        LOG.info(`Mapped payment terms (partial): "${invoiceTerms}" → "${pm.value}"`);
+        return pm.value;
+      }
+    }
+
+    // No match - return empty (SAP uses supplier default)
+    LOG.warn(`Payment terms not mapped: "${invoiceTerms}"`);
+    return '';
+  }
+
+  // ============================================
+  // BUILD ACCOUNTING DOCUMENT PAYLOAD
+  // ============================================
+  function buildAccountingDocPayload(header) {
+    const items = [];
+
+    // Vendor line (credit)
+    items.push({
+      GLAccount: '',
+      AccountingDocumentItem: '001',
+      AccountingDocumentItemType: 'K',
+      Supplier: header.matchedSupplierNumber,
+      AmountInTransactionCurrency: header.grossAmount,
+      DebitCreditCode: 'H',
+      DocumentItemText: header.documentNumber ? `Invoice ${header.documentNumber}` : 'AUTO'
     });
-    return url.pathname + url.search;
+
+    // Expense lines (debit)
+    let itemNum = 2;
+    for (const doxItem of header.doxItems || []) {
+      items.push({
+        GLAccount: '400000', // Default expense account
+        AccountingDocumentItem: String(itemNum).padStart(3, '0'),
+        AmountInTransactionCurrency: doxItem.netAmount,
+        DebitCreditCode: 'S',
+        TaxCode: doxItem.taxCode || '',
+        DocumentItemText: truncate(doxItem.description || 'Invoice Item', 50)
+      });
+      itemNum++;
+    }
+
+    // Tax line
+    if (header.taxAmount && header.taxAmount > 0) {
+      items.push({
+        GLAccount: '154000', // Default tax account
+        AccountingDocumentItem: String(itemNum).padStart(3, '0'),
+        AmountInTransactionCurrency: header.taxAmount,
+        DebitCreditCode: 'S',
+        TaxCode: header.doxItems?.[0]?.taxCode || '',
+        DocumentItemText: 'Tax'
+      });
+    }
+
+    return {
+      MessageHeader: {
+        CreationDateTime: new Date().toISOString()
+      },
+      JournalEntry: {
+        CompanyCode: header.companyCode,
+        DocumentDate: header.documentDate,
+        PostingDate: new Date().toISOString().split('T')[0],
+        DocumentHeaderText: header.documentNumber ? `Invoice ${header.documentNumber}` : 'AUTO',
+        DocumentReferenceID: header.documentNumber || '',
+        Items: items
+      }
+    };
   }
 };
