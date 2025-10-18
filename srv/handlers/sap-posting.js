@@ -167,11 +167,12 @@ module.exports = function(srv) {
     const client = process.env.S4_CLIENT || '100';
 
     try {
+      // ✅ FIXED: Only sap-client for POST requests, NO $format or other query options
       const { data } = await executeHttpRequest(
         { destinationName: destName },
         {
           method: 'POST',
-          url: buildUrl(path, { 'sap-client': client, $format: 'json' }),
+          url: buildUrl(path, { 'sap-client': client }),
           headers: {
             'Content-Type': 'application/json',
             'Accept': 'application/json'
@@ -218,11 +219,12 @@ module.exports = function(srv) {
     const client = process.env.S4_CLIENT || '100';
 
     try {
+      // ✅ FIXED: Only sap-client for POST requests, NO $format or other query options
       const { data } = await executeHttpRequest(
         { destinationName: destName },
         {
           method: 'POST',
-          url: buildUrl(path, { 'sap-client': client, $format: 'json' }),
+          url: buildUrl(path, { 'sap-client': client }),
           headers: {
             'Content-Type': 'application/json',
             'Accept': 'application/json'
