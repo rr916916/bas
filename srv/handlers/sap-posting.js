@@ -185,7 +185,7 @@ module.exports = function(srv) {
         fiscalYear: data?.FiscalYear || data?.d?.FiscalYear,
         docType: data?.AccountingDocumentType || 'KR',
         message: 'Invoice posted successfully',
-        messageClass: '',
+        messageClass: '', // Leave empty on success
         messageNumber: ''
       };
 

@@ -83,8 +83,8 @@ entity InvoiceHeader : cuid, managed {
   // --- SAP Response ---
   sapReturnType          : String(1)   @title: 'SAP Return Type'; // S, E, W, I
   sapReturnMessage       : String(255) @title: 'SAP Message';
-  sapMessageClass        : String(20)  @title: 'Message Class';
-  sapMessageNumber       : String(3)   @title: 'Message Number';
+  sapMessageClass        : String(100) @title: 'Message Class';
+  sapMessageNumber       : String(10)  @title: 'Message Number'; 
 
   // --- Supplier Matching (Vector) ---
   matchedSupplierNumber  : String(10)  @title: 'Matched Supplier';
